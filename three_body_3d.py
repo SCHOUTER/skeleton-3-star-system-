@@ -122,11 +122,49 @@ void main() {
     frag_color = vec4(vertex_color, 1.0);
 }
 """
-BODY_VERTEX_SHADER = """
-#version 330
+BODY_NOISE_GLSL = """
+float hash3(vec3 point) {
+    return fract(sin(dot(point, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+}
 
+float noise3(vec3 point) {
+    vec3 cell = floor(point);
+    vec3 f = fract(point);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float x00 = mix(hash3(cell), hash3(cell + vec3(1.0, 0.0, 0.0)), f.x);
+    float x10 = mix(hash3(cell + vec3(0.0, 1.0, 0.0)), hash3(cell + vec3(1.0, 1.0, 0.0)), f.x);
+    float x01 = mix(hash3(cell + vec3(0.0, 0.0, 1.0)), hash3(cell + vec3(1.0, 0.0, 1.0)), f.x);
+    float x11 = mix(hash3(cell + vec3(0.0, 1.0, 1.0)), hash3(cell + vec3(1.0, 1.0, 1.0)), f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+
+float fbm3(vec3 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    for (int i = 0; i < 4; i++) {
+        value += amplitude * noise3(p);
+        p = p * 2.0 + vec3(13.7, 9.2, 5.3);
+        amplitude *= 0.5;
+    }
+    return value / 0.9375;
+}
+
+// Shared by the vertex shader (shape) and fragment shader (colour),
+// so mountains and colours line up.
+float terrain_height(vec3 p, float seed) {
+    return fbm3(p * 1.5 + vec3(seed));
+}
+
+vec3 rotate_around_axis(vec3 v, vec3 axis, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
+}
+"""
+
+BODY_VERTEX_SHADER = "#version 330\n" + BODY_NOISE_GLSL + """
 in vec3 in_unit_position;
-in vec3 in_unit_normal;
 in vec3 in_center;
 in vec3 in_color;
 in float in_radius;
@@ -134,6 +172,9 @@ in float in_is_star;
 in vec3 in_rotation_axis;
 in float in_rotation_angle;
 in float in_is_gas;
+in float in_seed;
+in float in_oblateness;
+in float in_roughness;
 
 uniform mat4 view;
 uniform mat4 projection;
@@ -144,42 +185,64 @@ out vec3 world_normal;
 out vec3 surface_coordinates;
 flat out float body_is_star;
 flat out float body_is_gas;
+flat out float body_seed;
+flat out float body_angle;
 flat out vec3 body_rotation_axis;
 
-vec3 rotate_around_axis(vec3 vector, vec3 axis, float angle) {
-    float cosine = cos(angle);
-    float sine = sin(angle);
-    return vector * cosine
-        + cross(axis, vector) * sine
-        + axis * dot(axis, vector) * (1.0 - cosine);
+vec3 displaced(vec3 p, float seed, float rough) {
+    return p * (1.0 + rough * (terrain_height(p, seed) - 0.5) * 2.0);
+}
+
+vec3 terrain_normal(vec3 p, float seed, float rough) {
+    vec3 helper = abs(p.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t1 = normalize(cross(p, helper));
+    vec3 t2 = cross(p, t1);
+    float e = 0.004;
+    vec3 q0 = displaced(p, seed, rough);
+    vec3 q1 = displaced(normalize(p + t1 * e), seed, rough);
+    vec3 q2 = displaced(normalize(p + t2 * e), seed, rough);
+    vec3 n = normalize(cross(q1 - q0, q2 - q0));
+    return dot(n, p) < 0.0 ? -n : n;
 }
 
 void main() {
     vec3 axis = normalize(in_rotation_axis);
-    vec3 rotated_position = rotate_around_axis(
-        in_unit_position,
-        axis,
-        in_rotation_angle
-    );
-    world_position = in_center + rotated_position * in_radius;
-    world_normal = rotate_around_axis(
-        in_unit_normal,
-        axis,
-        in_rotation_angle
-    );
-    surface_coordinates = rotated_position;
+
+    vec3 p = in_unit_position;   // body-fixed coordinates
+    vec3 n = p;                  // exact normal on a unit sphere
+
+    bool rocky = in_is_star < 0.5 && in_is_gas < 0.5;
+    if (rocky && in_roughness > 0.0) {
+        n = terrain_normal(p, in_seed, in_roughness);
+        p = displaced(p, in_seed, in_roughness);
+    }
+
+    vec3 rp = rotate_around_axis(p, axis, in_rotation_angle);
+    vec3 rn = rotate_around_axis(n, axis, in_rotation_angle);
+
+    // Oblateness: squash along the spin axis (normals use the inverse transpose).
+    float f = in_oblateness;
+    rp -= axis * dot(axis, rp) * f;
+    rn = normalize(rn + axis * dot(axis, rn) * (1.0 / (1.0 - f) - 1.0));
+
+    world_position = in_center + rp * in_radius;
+    world_normal = rn;
+
+    // Body-fixed coordinates: surface detail now rotates WITH the body.
+    surface_coordinates = in_unit_position;
+
     vertex_color = in_color;
     body_is_star = in_is_star;
     body_is_gas = in_is_gas;
+    body_seed = in_seed;
+    body_angle = in_rotation_angle;
     body_rotation_axis = axis;
 
     gl_Position = projection * view * vec4(world_position, 1.0);
 }
 """
 
-BODY_FRAGMENT_SHADER = """
-#version 330
-
+BODY_FRAGMENT_SHADER = "#version 330\n" + BODY_NOISE_GLSL + """
 #define MAX_STAR_LIGHTS 32
 
 in vec3 vertex_color;
@@ -188,79 +251,161 @@ in vec3 world_normal;
 in vec3 surface_coordinates;
 flat in float body_is_star;
 flat in float body_is_gas;
+flat in float body_seed;
+flat in float body_angle;
 flat in vec3 body_rotation_axis;
 
 uniform int star_count;
 uniform vec4 star_lights[MAX_STAR_LIGHTS];
 uniform vec4 star_light_colors[MAX_STAR_LIGHTS];
+uniform vec3 camera_position;
+uniform float time;
 
 out vec4 frag_color;
 
-float hash3(vec3 point) {
-    return fract(sin(dot(point, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+vec3 hue_shift(vec3 c, float a) {
+    const vec3 k = vec3(0.57735027);
+    float ca = cos(a);
+    float sa = sin(a);
+    return c * ca + cross(k, c) * sa + k * dot(k, c) * (1.0 - ca);
 }
 
-float noise3(vec3 point) {
-    vec3 cell = floor(point);
-    vec3 fraction = fract(point);
-    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
-
-    float x00 = mix(hash3(cell), hash3(cell + vec3(1.0, 0.0, 0.0)), fraction.x);
-    float x10 = mix(hash3(cell + vec3(0.0, 1.0, 0.0)), hash3(cell + vec3(1.0, 1.0, 0.0)), fraction.x);
-    float x01 = mix(hash3(cell + vec3(0.0, 0.0, 1.0)), hash3(cell + vec3(1.0, 0.0, 1.0)), fraction.x);
-    float x11 = mix(hash3(cell + vec3(0.0, 1.0, 1.0)), hash3(cell + vec3(1.0, 1.0, 1.0)), fraction.x);
-    return mix(mix(x00, x10, fraction.y), mix(x01, x11, fraction.y), fraction.z);
+// Cheap bump mapping from the noise gradient. Tune `strength` to taste.
+vec3 bump_normal(vec3 n, vec3 s, float scale, float strength) {
+    float e = 0.01;
+    vec3 sp = s * scale;
+    vec3 g = vec3(
+        noise3(sp + vec3(e, 0.0, 0.0)) - noise3(sp - vec3(e, 0.0, 0.0)),
+        noise3(sp + vec3(0.0, e, 0.0)) - noise3(sp - vec3(0.0, e, 0.0)),
+        noise3(sp + vec3(0.0, 0.0, e)) - noise3(sp - vec3(0.0, 0.0, e))
+    ) / (2.0 * e);
+    g = rotate_around_axis(g, body_rotation_axis, body_angle);
+    g -= n * dot(g, n);
+    return normalize(n - g * strength);
 }
 
 void main() {
-    vec3 normal = normalize(world_normal);
-    vec3 surface = normalize(surface_coordinates);
+    vec3 n = normalize(world_normal);
+    vec3 s = normalize(surface_coordinates);
+    vec3 axis = normalize(body_rotation_axis);
+    vec3 view_dir = normalize(camera_position - world_position);
+    float mu = max(dot(n, view_dir), 0.0);
+    float seed = body_seed;
     vec3 albedo = vertex_color;
 
+    // ---------------- STARS ----------------
     if (body_is_star > 0.5) {
-        float granulation = noise3(surface * 34.0);
-        float spots = smoothstep(0.72, 0.88, noise3(surface * 8.0));
-        albedo *= 0.82 + 0.42 * granulation;
-        albedo *= 1.0 - 0.28 * spots;
-    } else if (body_is_gas > 0.5) {
-        float latitude = dot(surface, body_rotation_axis);
-        float bands = sin(latitude * 70.0 + noise3(surface * 7.0) * 2.0);
-        float storm = smoothstep(0.64, 0.82, noise3(surface * 11.0));
-        albedo *= 0.74 + 0.22 * bands + 0.18 * storm;
-    } else {
-        float terrain = noise3(surface * 10.0);
-        float detail = noise3(surface * 38.0);
-        float ice = smoothstep(0.64, 0.86, noise3(surface * 17.0));
-        albedo *= 0.58 + 0.62 * terrain + 0.16 * detail;
-        albedo = mix(albedo, albedo * vec3(1.2, 1.16, 1.08), ice * 0.35);
-    }
+        float t = time * 0.15;
+        float gran = 0.6 * noise3(s * 30.0 + vec3(t))
+                   + 0.4 * noise3(s * 70.0 - vec3(t * 1.7));
+        float spots = smoothstep(0.72, 0.88, noise3(s * 7.0 + vec3(seed)));
+        vec3 hot = albedo * (0.8 + 0.5 * gran) * (1.0 - 0.35 * spots);
 
-    if (body_is_star > 0.5) {
-        frag_color = vec4(albedo, 1.0);
+        // Limb darkening: edges are cooler and redder.
+        float limb = pow(mu, 0.55);
+        vec3 limb_tint = mix(vec3(1.0, 0.55, 0.30), vec3(1.0), limb);
+        frag_color = vec4(hot * limb_tint * mix(0.55, 1.15, limb), 1.0);
         return;
     }
 
+    // Per-planet hue jitter on top of the base colour (about +/-40 degrees).
+    float shift = fract(seed * 12.9898) - 0.5;
+    albedo = hue_shift(albedo, (fract(seed * 2.31) - 0.5) * 1.4);
+
+    vec3 bn = n;
+    float gloss = 0.0;
+    vec3 atmosphere = vec3(0.0);
+    float atmosphere_strength = 0.0;
+
+    if (body_is_gas > 0.5) {
+        // ---------------- GAS GIANTS ----------------
+        float lat = dot(s, axis);
+        float warp = fbm3(s * 3.0 + vec3(seed));
+        float coarse = noise3(vec3(lat * 6.0 + warp * 1.4, seed, 1.0));
+        float fine = noise3(vec3(lat * 17.0 + warp * 2.2, seed + 4.0, 2.0));
+
+        vec3 band_a = albedo;
+        vec3 band_b = hue_shift(albedo, 0.45 + fract(seed * 5.1) * 0.6) * 0.65;
+        vec3 band_c = mix(albedo, vec3(1.0), 0.45);
+
+        vec3 gas = mix(band_a, band_b, smoothstep(0.35, 0.65, coarse));
+        gas = mix(gas, band_c, smoothstep(0.55, 0.85, fine) * 0.7);
+
+        float storm = smoothstep(0.66, 0.80, noise3(s * vec3(4.0, 8.0, 4.0) + vec3(seed)));
+        storm *= 1.0 - abs(lat);
+        gas = mix(gas, hue_shift(albedo, 2.6) * 1.15, storm * 0.6);
+
+        albedo = gas;
+        atmosphere = mix(gas, vec3(0.75, 0.88, 1.0), 0.35);
+        atmosphere_strength = 0.8;
+    } else {
+        // ---------------- ROCKY PLANETS ----------------
+        float h = terrain_height(s, seed);
+        float detail = fbm3(s * 14.0 + vec3(seed * 1.7));
+
+        vec3 lowland = hue_shift(albedo, shift * 1.2) * 0.45;
+        vec3 highland = hue_shift(albedo, -shift * 0.8) * 1.35 + 0.05;
+        vec3 land = mix(lowland, albedo, smoothstep(0.34, 0.50, h));
+        land = mix(land, highland, smoothstep(0.54, 0.66, h));
+        land *= 0.8 + 0.4 * detail;
+
+        bool ocean_world = fract(seed * 3.7) > 0.65;
+        float water = ocean_world
+            ? 1.0 - smoothstep(0.455, 0.485, h)
+            : 0.0;
+        vec3 water_color = hue_shift(vec3(0.02, 0.10, 0.26), shift * 0.6);
+        albedo = mix(land, water_color, water);
+        gloss = water;
+
+        // Polar caps on some worlds.
+        float lat = abs(dot(s, axis));
+        float cap = smoothstep(0.80, 0.90, lat + (detail - 0.5) * 0.18);
+        cap *= step(0.35, fract(seed * 7.31));
+        albedo = mix(albedo, vec3(0.92, 0.96, 1.0), cap);
+        gloss *= 1.0 - cap;
+
+        bn = normalize(mix(bump_normal(n, s, 16.0, 0.10), n, water));
+
+        bool has_atmosphere = ocean_world || fract(seed * 9.1) > 0.45;
+        atmosphere = hue_shift(vec3(0.35, 0.55, 1.0), shift * 1.5);
+        atmosphere_strength = has_atmosphere ? 0.7 : 0.0;
+    }
+
+    // ---------------- LIGHTING ----------------
     vec3 direct_light = vec3(0.0);
-    for (int light_index = 0; light_index < MAX_STAR_LIGHTS; light_index++) {
-        if (light_index >= star_count) {
+    vec3 spec = vec3(0.0);
+    for (int i = 0; i < MAX_STAR_LIGHTS; i++) {
+        if (i >= star_count) {
             break;
         }
+        vec3 to_light = star_lights[i].xyz - world_position;
+        float d2 = max(dot(to_light, to_light), 1e-8);
+        vec3 ld = to_light * inversesqrt(d2);
+        float irr = star_lights[i].w / d2;
+        vec3 lc = star_light_colors[i].rgb;
 
-        vec3 to_light = star_lights[light_index].xyz - world_position;
-        float distance_squared = max(dot(to_light, to_light), 1e-8);
-        vec3 light_direction = to_light * inversesqrt(distance_squared);
-        float incidence = max(dot(normal, light_direction), 0.0);
-        float irradiance = star_lights[light_index].w / distance_squared;
-        direct_light += star_light_colors[light_index].rgb
-            * incidence * irradiance;
+        direct_light += lc * max(dot(bn, ld), 0.0) * irr;
+
+        vec3 hv = normalize(ld + view_dir);
+        spec += lc * pow(max(dot(bn, hv), 0.0), 90.0) * irr
+              * step(0.0, dot(n, ld));
     }
 
     float irradiance = dot(direct_light, vec3(0.2126, 0.7152, 0.0722));
     vec3 light_tint = direct_light / max(irradiance, 1e-6);
     float daylight = 1.0 - exp(-0.75 * irradiance);
     vec3 lighting = vec3(0.018) + light_tint * daylight * 1.2;
-    frag_color = vec4(albedo * lighting, 1.0);
+
+    float spec_l = dot(spec, vec3(0.2126, 0.7152, 0.0722));
+    vec3 spec_color = light_tint * (1.0 - exp(-0.75 * spec_l)) * gloss * 0.8;
+
+    // Atmospheric rim glow, strongest on the lit side.
+    float rim = pow(1.0 - mu, 3.0);
+    vec3 rim_light = atmosphere * rim * atmosphere_strength * (0.06 + daylight) * 1.2;
+
+    frag_color = vec4(albedo * lighting + spec_color + rim_light, 1.0);
 }
+
 """
 NEBULA_VERTEX_SHADER = """
 #version 330
@@ -833,6 +978,19 @@ body_is_gas[NUM_STARS:] = np.asarray(
     [planet_type == "gas" for planet_type in planet_types],
     dtype=np.float32,
 )
+shape_rng = np.random.default_rng(777)
+body_seeds = shape_rng.uniform(0.0, 100.0, NUM_BODIES).astype(np.float32)
+body_oblateness = np.zeros(NUM_BODIES, dtype=np.float32)
+body_roughness = np.zeros(NUM_BODIES, dtype=np.float32)
+
+for planet_index, planet_type in enumerate(planet_types):
+    body_index = NUM_STARS + planet_index
+    if planet_type == "gas":
+        # Faster spin -> flatter planet.
+        period_hours = planet_rotation_period_hours[planet_index]
+        body_oblateness[body_index] = float(np.clip(1.0 / period_hours, 0.03, 0.12))
+    else:
+        body_roughness[body_index] = shape_rng.uniform(0.03, 0.10)
 MAX_STAR_LIGHTS = 32
 if NUM_STARS > MAX_STAR_LIGHTS:
     raise ValueError(
@@ -1621,6 +1779,8 @@ def draw_system_labels(projection, view, width, height):
 if not glfw.init():
     raise RuntimeError("Could not initialize GLFW.")
 
+glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+glfw.window_hint(glfw.SAMPLES, 8)   
 glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
 glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
 glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
@@ -1832,62 +1992,44 @@ def chunk_is_visible(chunk_key, forward, right, camera_up, aspect, far_plane):
         and vertical <= half_height + vertical_extent
     )
 
-def create_sphere_vertices(latitude_segments=16, longitude_segments=32):
-    vertices = []
+def create_sphere_mesh(latitude_segments=128, longitude_segments=256):
+    lat = np.linspace(0.0, math.pi, latitude_segments + 1)
+    lon = np.linspace(0.0, 2.0 * math.pi, longitude_segments + 1)
+    lat_grid, lon_grid = np.meshgrid(lat, lon, indexing="ij")
+    vertices = np.stack([
+        np.sin(lat_grid) * np.cos(lon_grid),
+        np.cos(lat_grid),
+        np.sin(lat_grid) * np.sin(lon_grid),
+    ], axis=-1).reshape(-1, 3).astype(np.float32)
 
-    def sphere_point(latitude, longitude):
-        return (
-            math.sin(latitude) * math.cos(longitude),
-            math.cos(latitude),
-            math.sin(latitude) * math.sin(longitude),
-        )
-
-    for latitude_index in range(latitude_segments):
-        latitude_start = math.pi * latitude_index / latitude_segments
-        latitude_end = math.pi * (latitude_index + 1) / latitude_segments
-
-        for longitude_index in range(longitude_segments):
-            longitude_start = (
-                2.0 * math.pi * longitude_index / longitude_segments
-            )
-            longitude_end = (
-                2.0 * math.pi * (longitude_index + 1) / longitude_segments
-            )
-            top_left = sphere_point(latitude_start, longitude_start)
-            bottom_left = sphere_point(latitude_end, longitude_start)
-            top_right = sphere_point(latitude_start, longitude_end)
-            bottom_right = sphere_point(latitude_end, longitude_end)
-
-            for point in (
-                top_left,
-                bottom_left,
-                top_right,
-                top_right,
-                bottom_left,
-                bottom_right,
-            ):
-                vertices.append((*point, *point))
-
-    return np.asarray(vertices, dtype=np.float32)
+    row = longitude_segments + 1
+    i = np.arange(latitude_segments)[:, None]
+    j = np.arange(longitude_segments)[None, :]
+    top_left = i * row + j
+    bottom_left = (i + 1) * row + j
+    top_right = top_left + 1
+    bottom_right = bottom_left + 1
+    indices = np.stack(
+        [top_left, bottom_left, top_right,
+         top_right, bottom_left, bottom_right],
+        axis=-1,
+    ).reshape(-1).astype(np.uint32)
+    return vertices, indices
 
 
-sphere_vertices = create_sphere_vertices()
+sphere_vertices, sphere_indices = create_sphere_mesh()
 sphere_buffer = ctx.buffer(sphere_vertices.tobytes())
-body_buffer = ctx.buffer(reserve=NUM_BODIES * 13 * 4)
+sphere_index_buffer = ctx.buffer(sphere_indices.tobytes())
+body_buffer = ctx.buffer(reserve=NUM_BODIES * 16 * 4)   # was 13 floats per body
 star_light_data = np.zeros((MAX_STAR_LIGHTS, 4), dtype=np.float32)
 star_light_color_data = np.zeros((MAX_STAR_LIGHTS, 4), dtype=np.float32)
 body_vao = ctx.vertex_array(
     body_program,
     [
-        (
-            sphere_buffer,
-            "3f 3f",
-            "in_unit_position",
-            "in_unit_normal",
-        ),
+        (sphere_buffer, "3f", "in_unit_position"),
         (
             body_buffer,
-            "3f 3f 1f 1f 3f 1f 1f /i",
+            "3f 3f 1f 1f 3f 1f 1f 1f 1f 1f /i",
             "in_center",
             "in_color",
             "in_radius",
@@ -1895,8 +2037,13 @@ body_vao = ctx.vertex_array(
             "in_rotation_axis",
             "in_rotation_angle",
             "in_is_gas",
+            "in_seed",
+            "in_oblateness",
+            "in_roughness",
         ),
     ],
+    index_buffer=sphere_index_buffer,
+    index_element_size=4,
 )
 
 # ============================================================
@@ -2577,6 +2724,9 @@ try:
             rotation_axes.astype(np.float32),
             rotation_angles[:, None].astype(np.float32),
             body_is_gas[:, None],
+            body_seeds[:, None],          
+            body_oblateness[:, None],    
+            body_roughness[:, None],   
         ]).astype(np.float32)
 
         body_buffer.write(body_data.tobytes())
@@ -2635,9 +2785,9 @@ try:
         body_program["projection"].write(projection.T.astype("f4").tobytes())
         body_program["star_count"].value = NUM_STARS
         body_program["star_lights"].write(star_light_data.tobytes())
-        body_program["star_light_colors"].write(
-            star_light_color_data.tobytes()
-        )
+        body_program["star_light_colors"].write(star_light_color_data.tobytes())
+        body_program["camera_position"].value = tuple(float(v) for v in camera_position)
+        body_program["time"].value = float(current_time)
 
         point_program["mvp"].write(mvp.T.astype("f4").tobytes())
         line_program["mvp"].write(mvp.T.astype("f4").tobytes())
@@ -2687,7 +2837,7 @@ try:
         # Main bodies
         body_vao.render(
             mode=moderngl.TRIANGLES,
-            vertices=len(sphere_vertices),
+            vertices=len(sphere_indices),     # was len(sphere_vertices)
             instances=NUM_BODIES if show_planets else NUM_STARS,
         )
 
@@ -2737,6 +2887,7 @@ finally:
 
     body_vao.release()
     body_buffer.release()
+    sphere_index_buffer.release()
     sphere_buffer.release()
     point_program.release()
     line_program.release()
