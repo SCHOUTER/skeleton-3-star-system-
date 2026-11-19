@@ -16,6 +16,7 @@ WIDTH, HEIGHT = 1400, 900
 DT = 0.00001
 STEPS_PER_FRAME = 10
 TRAIL_LENGTH = 1800
+HISTORY_TRIM_BATCH = 128
 TRAIL_UPDATE_INTERVAL = 0.10
 
 G = 4.0 * math.pi**2  # AU^3 / (solar mass * year^2)
@@ -124,65 +125,141 @@ void main() {
 BODY_VERTEX_SHADER = """
 #version 330
 
-in vec3 in_position;
+in vec3 in_unit_position;
+in vec3 in_unit_normal;
+in vec3 in_center;
 in vec3 in_color;
-in float in_size;
+in float in_radius;
+in float in_is_star;
+in vec3 in_rotation_axis;
+in float in_rotation_angle;
+in float in_is_gas;
 
 uniform mat4 view;
 uniform mat4 projection;
 
 out vec3 vertex_color;
-flat out vec3 view_center;
-flat out float point_size;
+out vec3 world_position;
+out vec3 world_normal;
+out vec3 surface_coordinates;
+flat out float body_is_star;
+flat out float body_is_gas;
+flat out vec3 body_rotation_axis;
+
+vec3 rotate_around_axis(vec3 vector, vec3 axis, float angle) {
+    float cosine = cos(angle);
+    float sine = sin(angle);
+    return vector * cosine
+        + cross(axis, vector) * sine
+        + axis * dot(axis, vector) * (1.0 - cosine);
+}
 
 void main() {
-    vec4 center = view * vec4(in_position, 1.0);
-
-    view_center = center.xyz;
+    vec3 axis = normalize(in_rotation_axis);
+    vec3 rotated_position = rotate_around_axis(
+        in_unit_position,
+        axis,
+        in_rotation_angle
+    );
+    world_position = in_center + rotated_position * in_radius;
+    world_normal = rotate_around_axis(
+        in_unit_normal,
+        axis,
+        in_rotation_angle
+    );
+    surface_coordinates = rotated_position;
     vertex_color = in_color;
-    point_size = in_size;
+    body_is_star = in_is_star;
+    body_is_gas = in_is_gas;
+    body_rotation_axis = axis;
 
-    gl_Position = projection * center;
-    gl_PointSize = in_size;
+    gl_Position = projection * view * vec4(world_position, 1.0);
 }
 """
 
 BODY_FRAGMENT_SHADER = """
 #version 330
 
-in vec3 vertex_color;
-flat in vec3 view_center;
-flat in float point_size;
+#define MAX_STAR_LIGHTS 32
 
-uniform mat4 projection;
-uniform float viewport_height;
+in vec3 vertex_color;
+in vec3 world_position;
+in vec3 world_normal;
+in vec3 surface_coordinates;
+flat in float body_is_star;
+flat in float body_is_gas;
+flat in vec3 body_rotation_axis;
+
+uniform int star_count;
+uniform vec4 star_lights[MAX_STAR_LIGHTS];
+uniform vec4 star_light_colors[MAX_STAR_LIGHTS];
 
 out vec4 frag_color;
 
+float hash3(vec3 point) {
+    return fract(sin(dot(point, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+float noise3(vec3 point) {
+    vec3 cell = floor(point);
+    vec3 fraction = fract(point);
+    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+
+    float x00 = mix(hash3(cell), hash3(cell + vec3(1.0, 0.0, 0.0)), fraction.x);
+    float x10 = mix(hash3(cell + vec3(0.0, 1.0, 0.0)), hash3(cell + vec3(1.0, 1.0, 0.0)), fraction.x);
+    float x01 = mix(hash3(cell + vec3(0.0, 0.0, 1.0)), hash3(cell + vec3(1.0, 0.0, 1.0)), fraction.x);
+    float x11 = mix(hash3(cell + vec3(0.0, 1.0, 1.0)), hash3(cell + vec3(1.0, 1.0, 1.0)), fraction.x);
+    return mix(mix(x00, x10, fraction.y), mix(x01, x11, fraction.y), fraction.z);
+}
+
 void main() {
-    vec2 p = (gl_PointCoord - vec2(0.5)) * 2.0;
+    vec3 normal = normalize(world_normal);
+    vec3 surface = normalize(surface_coordinates);
+    vec3 albedo = vertex_color;
 
-    float r2 = dot(p, p);
-
-    if (r2 > 1.0) {
-        discard;
+    if (body_is_star > 0.5) {
+        float granulation = noise3(surface * 34.0);
+        float spots = smoothstep(0.72, 0.88, noise3(surface * 8.0));
+        albedo *= 0.82 + 0.42 * granulation;
+        albedo *= 1.0 - 0.28 * spots;
+    } else if (body_is_gas > 0.5) {
+        float latitude = dot(surface, body_rotation_axis);
+        float bands = sin(latitude * 70.0 + noise3(surface * 7.0) * 2.0);
+        float storm = smoothstep(0.64, 0.82, noise3(surface * 11.0));
+        albedo *= 0.74 + 0.22 * bands + 0.18 * storm;
+    } else {
+        float terrain = noise3(surface * 10.0);
+        float detail = noise3(surface * 38.0);
+        float ice = smoothstep(0.64, 0.86, noise3(surface * 17.0));
+        albedo *= 0.58 + 0.62 * terrain + 0.16 * detail;
+        albedo = mix(albedo, albedo * vec3(1.2, 1.16, 1.08), ice * 0.35);
     }
 
-    float depth = -view_center.z;
+    if (body_is_star > 0.5) {
+        frag_color = vec4(albedo, 1.0);
+        return;
+    }
 
-    float radius = point_size * depth /
-                   (projection[1][1] * viewport_height);
+    vec3 direct_light = vec3(0.0);
+    for (int light_index = 0; light_index < MAX_STAR_LIGHTS; light_index++) {
+        if (light_index >= star_count) {
+            break;
+        }
 
-    float z = sqrt(1.0 - r2);
+        vec3 to_light = star_lights[light_index].xyz - world_position;
+        float distance_squared = max(dot(to_light, to_light), 1e-8);
+        vec3 light_direction = to_light * inversesqrt(distance_squared);
+        float incidence = max(dot(normal, light_direction), 0.0);
+        float irradiance = star_lights[light_index].w / distance_squared;
+        direct_light += star_light_colors[light_index].rgb
+            * incidence * irradiance;
+    }
 
-    vec3 surface_position = view_center +
-        vec3(p.x * radius, p.y * radius, z * radius);
-
-    vec4 clip_position = projection * vec4(surface_position, 1.0);
-
-    gl_FragDepth = (clip_position.z / clip_position.w) * 0.5 + 0.5;
-
-    frag_color = vec4(vertex_color, 1.0);
+    float irradiance = dot(direct_light, vec3(0.2126, 0.7152, 0.0722));
+    vec3 light_tint = direct_light / max(irradiance, 1e-6);
+    float daylight = 1.0 - exp(-0.75 * irradiance);
+    vec3 lighting = vec3(0.018) + light_tint * daylight * 1.2;
+    frag_color = vec4(albedo * lighting, 1.0);
 }
 """
 NEBULA_VERTEX_SHADER = """
@@ -338,6 +415,10 @@ planet_names = [
 ]
 
 planet_types = ["rocky"] * 6 + ["gas"] * 4
+planet_rotation_period_hours = [
+    24.0, 36.0, 23.93, 24.62, 18.0, 30.0,
+    9.93, 10.7, 9.9, 16.1,
+]
 
 planet_masses = np.array([
     1.0e-6, 2.0e-6, 3.0e-6, 2.5e-6, 4.0e-6, 5.0e-6,
@@ -588,6 +669,7 @@ for system_index, system_name in enumerate(system_names[1:]):
             extra_planet_sizes.append(
                 float(system_rng.uniform(8.0, 14.0))
             )
+            planet_rotation_period_hours.append(10.5)
         else:
             planet_masses = np.append(
                 planet_masses, system_rng.uniform(1e-6, 2e-5)
@@ -601,6 +683,7 @@ for system_index, system_name in enumerate(system_names[1:]):
             extra_planet_sizes.append(
                 float(system_rng.uniform(5.0, 9.0))
             )
+            planet_rotation_period_hours.append(24.0)
 
         planet_orbit_radii = np.append(planet_orbit_radii, orbit_radius)
 
@@ -660,10 +743,72 @@ velocities -= (
     np.sum(masses[:, None] * velocities, axis=0) / np.sum(masses)
 )
 
+rotation_rng = np.random.default_rng(20261119)
+star_rotation_period_years = (
+    np.clip(25.0 / np.sqrt(star_masses), 5.0, 60.0) / 365.25
+)
+planet_rotation_period_years = (
+    np.asarray(planet_rotation_period_hours, dtype=np.float64)
+    / (24.0 * 365.25)
+)
+rotation_period_years = np.concatenate([
+    star_rotation_period_years,
+    planet_rotation_period_years,
+])
+rotation_phases = rotation_rng.uniform(0.0, 2.0 * math.pi, NUM_BODIES)
+initial_rotation_phases = rotation_phases.copy()
+rotation_axes = np.zeros((NUM_BODIES, 3), dtype=np.float64)
+
+for star_index in range(NUM_STARS):
+    axis = rotation_rng.normal(size=3)
+    rotation_axes[star_index] = axis / np.linalg.norm(axis)
+
+for system_index, planet_indices in enumerate(system_planet_indices):
+    star_indices = np.asarray(
+        system_star_indices[system_index],
+        dtype=np.intp,
+    )
+    system_center = np.average(
+        positions[star_indices],
+        axis=0,
+        weights=masses[star_indices],
+    )
+    system_velocity = np.average(
+        velocities[star_indices],
+        axis=0,
+        weights=masses[star_indices],
+    )
+
+    for planet_index in planet_indices:
+        body_index = NUM_STARS + planet_index
+        relative_position = positions[body_index] - system_center
+        relative_velocity = velocities[body_index] - system_velocity
+        orbit_normal = np.cross(relative_position, relative_velocity)
+        orbit_normal /= np.linalg.norm(orbit_normal)
+
+        reference = np.array([1.0, 0.0, 0.0])
+        if abs(float(np.dot(orbit_normal, reference))) > 0.9:
+            reference = np.array([0.0, 0.0, 1.0])
+        tangent = np.cross(orbit_normal, reference)
+        tangent /= np.linalg.norm(tangent)
+        bitangent = np.cross(orbit_normal, tangent)
+
+        tilt = rotation_rng.uniform(0.0, math.radians(30.0))
+        azimuth = rotation_rng.uniform(0.0, 2.0 * math.pi)
+        tilt_direction = (
+            math.cos(azimuth) * tangent
+            + math.sin(azimuth) * bitangent
+        )
+        rotation_axes[body_index] = (
+            math.cos(tilt) * orbit_normal
+            + math.sin(tilt) * tilt_direction
+        )
+
+initial_rotation_period_years = rotation_period_years.copy()
+
 # ============================================================
 # DISPLAY SETTINGS
-# Point sizes are pixels, not physical radii.
-# Planets are exaggerated so they can be seen.
+# Display exaggeration keeps physical-size spheres visible at astronomical scales.
 # ============================================================
 
 star_colors = [
@@ -674,21 +819,37 @@ star_colors = [
 
 body_colors = star_colors + planet_colors
 
-body_sizes = np.array(
+body_reference_pixel_sizes = np.array(
     [42, 38, 48] + extra_star_sizes
     + [5, 5, 6, 6, 6, 7, 9, 10, 11, 12]
     + extra_planet_sizes,
     dtype=np.float32,
 )
-#save originals for reset
+body_visual_scales = np.ones(NUM_BODIES, dtype=np.float32)
+body_is_star = np.zeros(NUM_BODIES, dtype=np.float32)
+body_is_star[:NUM_STARS] = 1.0
+body_is_gas = np.zeros(NUM_BODIES, dtype=np.float32)
+body_is_gas[NUM_STARS:] = np.asarray(
+    [planet_type == "gas" for planet_type in planet_types],
+    dtype=np.float32,
+)
+MAX_STAR_LIGHTS = 32
+if NUM_STARS > MAX_STAR_LIGHTS:
+    raise ValueError(
+        f"At most {MAX_STAR_LIGHTS} stars can be used as shader light sources."
+    )
 initial_positions = positions.copy()
 initial_velocities = velocities.copy()
 initial_masses = masses.copy()
-initial_body_sizes = body_sizes.copy()
+initial_body_visual_scales = body_visual_scales.copy()
 
-# Calculate physical planet radii from mass and density.
+# Calculate physical body radii from mass and density.
 SOLAR_MASS_KG = 1.98847e30
 AU_METERS = 1.495978707e11
+MIN_MASS_SOLAR = 1e-12
+MIN_VOLUME_KM3 = 1e-12
+MIN_VISUAL_SCALE = 0.01
+MIN_ROTATION_PERIOD_DAYS = 0.01
 
 planet_radii_au = []
 
@@ -716,16 +877,47 @@ for mass, density in zip(star_masses, star_densities):
 
 star_radii_au = np.array(star_radii_au)
 
+star_volumes_km3 = (
+    (4.0 / 3.0) * math.pi * (star_radii_au * AU_METERS / 1000.0)**3
+)
+initial_star_volumes_km3 = star_volumes_km3.copy()
+
 collision_radii = np.concatenate([
     star_radii_au,
     planet_radii_au
 ])
+REFERENCE_CAMERA_DISTANCE_AU = 4.5
+REFERENCE_PROJECTION_SCALE = 1.0 / math.tan(math.radians(60.0) * 0.5)
+body_visual_exaggeration = (
+    body_reference_pixel_sizes
+    * REFERENCE_CAMERA_DISTANCE_AU
+    / (
+        REFERENCE_PROJECTION_SCALE
+        * HEIGHT
+        * collision_radii
+    )
+)
 # Planet volumes in km cube
 planet_volumes_km3 = (
     (4.0 / 3.0) * math.pi * (planet_radii_au * AU_METERS / 1000.0)**3
 )
 initial_planet_volumes_km3 = planet_volumes_km3.copy()
-#update planet physics
+
+
+def update_star_physics(body_index):
+    volume_m3 = star_volumes_km3[body_index] * 1e9
+    mass_kg = masses[body_index] * SOLAR_MASS_KG
+    density_kg_m3 = mass_kg / volume_m3
+    star_densities[body_index] = density_kg_m3 / 1000.0
+
+    radius_km = (
+        3.0 * star_volumes_km3[body_index] / (4.0 * math.pi)
+    ) ** (1.0 / 3.0)
+    radius_au = radius_km * 1000.0 / AU_METERS
+    star_radii_au[body_index] = radius_au
+    collision_radii[body_index] = radius_au
+
+
 def update_planet_physics(body_index):
     planet_index = body_index - NUM_STARS
 
@@ -780,34 +972,75 @@ def physics_step():
     # Velocity-Verlet / leapfrog-style integration.
     global positions, velocities, paused
 
+    previous_positions = positions.copy()
+    previous_velocities = velocities.copy()
+
     a0 = acceleration(positions)
     velocities += 0.5 * a0 * DT
     positions += velocities * DT
 
-    # Check for collisions at the new positions.
-    collision = detect_collision(positions)
+    collision = detect_collision(positions, previous_positions)
 
     if collision is not None:
         body_a, body_b = collision
-        print(f"COLLISION! Body {body_a} and Body {body_b}")
+        positions[:] = previous_positions
+        velocities[:] = previous_velocities
+        print(
+            f"COLLISION! Simulation stopped before overlap between "
+            f"Body {body_a} and Body {body_b}."
+        )
         paused = True
-        return
+        return False
 
     a1 = acceleration(positions)
     velocities += 0.5 * a1 * DT
+    return True
 
 #collision detection
-def detect_collision(pos):
-    for i in range(NUM_BODIES):
-        for j in range(i + 1, NUM_BODIES):
-            distance = np.linalg.norm(pos[i] - pos[j])
+def detect_collision(pos, previous_pos=None):
+    if previous_pos is None:
+        pairwise_offsets = pos[:, None, :] - pos[None, :, :]
+        pairwise_distances = np.linalg.norm(pairwise_offsets, axis=2)
+    else:
+        pairwise_offsets = (
+            previous_pos[:, None, :] - previous_pos[None, :, :]
+        )
+        pairwise_motion = (
+            (pos - previous_pos)[:, None, :]
+            - (pos - previous_pos)[None, :, :]
+        )
+        motion_squared = np.einsum(
+            "ijk,ijk->ij",
+            pairwise_motion,
+            pairwise_motion,
+        )
+        start_motion_dot = np.einsum(
+            "ijk,ijk->ij",
+            pairwise_offsets,
+            pairwise_motion,
+        )
+        closest_time = np.zeros_like(motion_squared)
+        np.divide(
+            -start_motion_dot,
+            motion_squared,
+            out=closest_time,
+            where=motion_squared > 1e-20,
+        )
+        np.clip(closest_time, 0.0, 1.0, out=closest_time)
+        closest_offsets = (
+            pairwise_offsets + closest_time[:, :, None] * pairwise_motion
+        )
+        pairwise_distances = np.linalg.norm(closest_offsets, axis=2)
 
-            minimum_distance = collision_radii[i] + collision_radii[j]
+    minimum_distances = collision_radii[:, None] + collision_radii[None, :]
+    colliding_pairs = np.argwhere(
+        np.triu(pairwise_distances <= minimum_distances, k=1)
+    )
 
-            if distance <= minimum_distance:
-                return i, j
+    if len(colliding_pairs) == 0:
+        return None
 
-    return None    
+    return tuple(int(index) for index in colliding_pairs[0])
 
 
 #body controls init for gui
@@ -826,10 +1059,27 @@ def set_body_value(sender, app_data, user_data):
         velocities[body_index, component] = app_data
 
     elif property_name == "mass":
+        if not math.isfinite(app_data) or app_data < MIN_MASS_SOLAR:
+            print(f"Mass must be finite and at least {MIN_MASS_SOLAR:g} solar masses.")
+            dpg.set_value(sender, float(masses[body_index]))
+            return
+
         masses[body_index] = app_data
 
         if body_index >= NUM_STARS:
             update_planet_physics(body_index)
+        else:
+            update_star_physics(body_index)
+
+        density = (
+            star_densities[body_index]
+            if body_index < NUM_STARS
+            else planet_densities[body_index - NUM_STARS]
+        )
+        dpg.set_value(
+            f"density_{body_index}",
+            f"Density: {density:.3f} g/cm³",
+        )
 
         for i in range(NUM_BODIES):
             history[i].clear()
@@ -838,12 +1088,69 @@ def set_body_value(sender, app_data, user_data):
             )
 
     elif property_name == "volume":
-        planet_index = body_index - NUM_STARS
-        planet_volumes_km3[planet_index] = app_data
-        update_planet_physics(body_index)
+        if not math.isfinite(app_data) or app_data < MIN_VOLUME_KM3:
+            print(f"Volume must be finite and at least {MIN_VOLUME_KM3:g} km³.")
+            dpg.set_value(
+                sender,
+                float(
+                    planet_volumes_km3[body_index - NUM_STARS]
+                    if body_index >= NUM_STARS
+                    else star_volumes_km3[body_index]
+                ),
+            )
+            return
+
+        if body_index >= NUM_STARS:
+            planet_index = body_index - NUM_STARS
+            planet_volumes_km3[planet_index] = app_data
+            update_planet_physics(body_index)
+            density = planet_densities[planet_index]
+        else:
+            star_volumes_km3[body_index] = app_data
+            update_star_physics(body_index)
+            density = star_densities[body_index]
+        dpg.set_value(
+            f"density_{body_index}",
+            f"Density: {density:.3f} g/cm³",
+        )
 
     elif property_name == "size":
-        body_sizes[body_index] = app_data
+        if not math.isfinite(app_data) or app_data < MIN_VISUAL_SCALE:
+            print(
+                "Visual radius multiplier must be finite and at least "
+                f"{MIN_VISUAL_SCALE:g}."
+            )
+            dpg.set_value(sender, float(body_visual_scales[body_index]))
+            return
+
+        body_visual_scales[body_index] = app_data
+
+    elif property_name == "rotation_period":
+        if (
+            not math.isfinite(app_data)
+            or app_data < MIN_ROTATION_PERIOD_DAYS
+        ):
+            print(
+                "Rotation period must be finite and at least "
+                f"{MIN_ROTATION_PERIOD_DAYS:g} days."
+            )
+            dpg.set_value(
+                sender,
+                float(rotation_period_years[body_index] * 365.25),
+            )
+            return
+
+        old_period_years = rotation_period_years[body_index]
+        new_period_years = app_data / 365.25
+        current_angle = (
+            rotation_phases[body_index]
+            + 2.0 * math.pi * simulation_years / old_period_years
+        )
+        rotation_period_years[body_index] = new_period_years
+        rotation_phases[body_index] = (
+            current_angle
+            - 2.0 * math.pi * simulation_years / new_period_years
+        ) % (2.0 * math.pi)
 
 #reset
 def reset_simulation():
@@ -852,11 +1159,17 @@ def reset_simulation():
     positions[:] = initial_positions
     velocities[:] = initial_velocities
     masses[:] = initial_masses
-    body_sizes[:] = initial_body_sizes
+    body_visual_scales[:] = initial_body_visual_scales
+    rotation_period_years[:] = initial_rotation_period_years
+    rotation_phases[:] = initial_rotation_phases
+    star_volumes_km3[:] = initial_star_volumes_km3
     planet_volumes_km3[:] = initial_planet_volumes_km3
 
-    for body_index in range(NUM_STARS, NUM_BODIES):
-        update_planet_physics(body_index)
+    for body_index in range(NUM_BODIES):
+        if body_index < NUM_STARS:
+            update_star_physics(body_index)
+        else:
+            update_planet_physics(body_index)
 
     simulation_years = 0.0
     paused = False
@@ -878,18 +1191,24 @@ def reset_simulation():
             )
 
         dpg.set_value(f"mass_{i}", float(masses[i]))
-        dpg.set_value(f"size_{i}", float(body_sizes[i]))
+        dpg.set_value(f"size_{i}", float(body_visual_scales[i]))
+        dpg.set_value(
+            f"rotation_period_{i}",
+            float(rotation_period_years[i] * 365.25),
+        )
 
-        if i >= NUM_STARS:
+        if i < NUM_STARS:
+            volume = star_volumes_km3[i]
+            density = star_densities[i]
+        else:
             planet_index = i - NUM_STARS
-            dpg.set_value(
-                f"volume_{i}",
-                float(planet_volumes_km3[planet_index])
-            )
-            dpg.set_value(
-                f"density_{i}",
-                f"Density: {planet_densities[planet_index]:.3f} g/cm³"
-            )
+            volume = planet_volumes_km3[planet_index]
+            density = planet_densities[planet_index]
+        dpg.set_value(f"volume_{i}", float(volume))
+        dpg.set_value(
+            f"density_{i}",
+            f"Density: {density:.3f} g/cm³",
+        )
 
     dpg.set_item_label("pause_button", "Pause")
 
@@ -927,38 +1246,72 @@ def add_body_controls(body_index, body_name):
 
         dpg.add_separator()
 
+        mass = float(masses[body_index])
+        mass_step = max(mass * 0.01, MIN_MASS_SOLAR)
         dpg.add_input_float(
             tag=f"mass_{body_index}",
             label="Mass (solar masses)",
-            default_value=float(masses[body_index]),
+            default_value=mass,
+            format="%.3e",
+            step=mass_step,
+            step_fast=mass_step * 10.0,
+            min_value=MIN_MASS_SOLAR,
+            min_clamped=True,
             callback=set_body_value,
             user_data=("mass", body_index, None),
             width=200
         )
 
-        if body_index >= NUM_STARS:
+        if body_index < NUM_STARS:
+            volume = star_volumes_km3[body_index]
+            density = star_densities[body_index]
+        else:
             planet_index = body_index - NUM_STARS
-
-            dpg.add_input_float(
-                tag=f"volume_{body_index}",
-                label="Volume (km³)",
-                default_value=float(planet_volumes_km3[planet_index]),
-                callback=set_body_value,
-                user_data=("volume", body_index, None),
-                width=200
-            )
-
-            dpg.add_text(
-                f"Density: {planet_densities[planet_index]:.3f} g/cm³",
-                tag=f"density_{body_index}"
-            )
+            volume = planet_volumes_km3[planet_index]
+            density = planet_densities[planet_index]
+        dpg.add_input_float(
+            tag=f"volume_{body_index}",
+            label="Volume (km³)",
+            default_value=float(volume),
+            format="%.3e",
+            step=max(float(volume) * 0.01, MIN_VOLUME_KM3),
+            step_fast=max(float(volume) * 0.1, MIN_VOLUME_KM3),
+            min_value=MIN_VOLUME_KM3,
+            min_clamped=True,
+            callback=set_body_value,
+            user_data=("volume", body_index, None),
+            width=200
+        )
+        dpg.add_text(
+            f"Density: {density:.3f} g/cm³",
+            tag=f"density_{body_index}"
+        )
 
         dpg.add_input_float(
             tag=f"size_{body_index}",
-            label="Visual Size",
-            default_value=float(body_sizes[body_index]),
+            label="Visual Radius Multiplier",
+            default_value=float(body_visual_scales[body_index]),
+            format="%.2f",
+            step=0.1,
+            step_fast=0.5,
+            min_value=MIN_VISUAL_SCALE,
+            min_clamped=True,
             callback=set_body_value,
             user_data=("size", body_index, None),
+            width=200
+        )
+        period_days = float(rotation_period_years[body_index] * 365.25)
+        dpg.add_input_float(
+            tag=f"rotation_period_{body_index}",
+            label="Rotation Period (days)",
+            default_value=period_days,
+            format="%.4f",
+            step=max(period_days * 0.01, MIN_ROTATION_PERIOD_DAYS * 0.1),
+            step_fast=max(period_days * 0.1, MIN_ROTATION_PERIOD_DAYS),
+            min_value=MIN_ROTATION_PERIOD_DAYS,
+            min_clamped=True,
+            callback=set_body_value,
+            user_data=("rotation_period", body_index, None),
             width=200
         )
        
@@ -983,20 +1336,25 @@ def apparent_position(body_index, current_time, body_history):
         return current_position
 
     target_time = current_time - delay
-    history_times = np.array([item[0] for item in history])
-    history_positions = np.array([item[1] for item in history])
+    if target_time <= history[0][0]:
+        return history[0][1]
 
-    if target_time <= history_times[0]:
-        return history_positions[0]
-
-    if target_time >= history_times[-1]:
+    if target_time >= history[-1][0]:
         return current_position
 
-    result = np.array([
-        np.interp(target_time, history_times, history_positions[:, axis])
-        for axis in range(3)
-    ])
-    return result
+    low = 0
+    high = len(history) - 1
+    while high - low > 1:
+        middle = (low + high) // 2
+        if history[middle][0] <= target_time:
+            low = middle
+        else:
+            high = middle
+
+    time_a, position_a = history[low]
+    time_b, position_b = history[high]
+    fraction = (target_time - time_a) / (time_b - time_a)
+    return position_a + (position_b - position_a) * fraction
 
 
 # Store simulation time and positions for the light-delay calculation.
@@ -1012,6 +1370,7 @@ for i in range(NUM_BODIES):
 
 BACKGROUND_CHUNK_SIZE = 200.0
 STARS_PER_CHUNK = 75000
+BACKGROUND_STAR_LOD_COUNT = 24000
 BACKGROUND_CHUNK_OFFSETS = [
     (x, y, z)
     for x in (-1, 0, 1)
@@ -1103,11 +1462,13 @@ def generate_star_chunk(chunk_x, chunk_y, chunk_z):
         3.5,
     ).astype(np.float32)
 
-    return np.column_stack([
+    star_data = np.column_stack([
         star_positions.astype(np.float32),
         colors,
         sizes,
     ]).astype(np.float32)
+    chunk_rng.shuffle(star_data, axis=0)
+    return star_data
 
 
 def generate_visible_stars(center_chunk):
@@ -1434,29 +1795,95 @@ def chunk_is_visible(chunk_key, forward, right, camera_up, aspect, far_plane):
     relative = chunk_center - camera_position
 
     depth = float(np.dot(relative, forward))
-    radius = BACKGROUND_CHUNK_SIZE * np.sqrt(3.0) * 0.5
+    half_size = BACKGROUND_CHUNK_SIZE * 0.5
+    depth_extent = half_size * np.abs(forward).sum()
+    horizontal_extent = half_size * np.abs(right).sum()
+    vertical_extent = half_size * np.abs(camera_up).sum()
 
-    if depth + radius < 0.1 or depth - radius > far_plane:
+    if (
+        depth + depth_extent < 0.1
+        or depth - depth_extent > far_plane
+    ):
         return False
 
     tan_half_vertical = math.tan(math.radians(60.0) * 0.5)
-    half_height = max(depth, 0.0) * tan_half_vertical
+    farthest_depth = max(depth + depth_extent, 0.0)
+    half_height = farthest_depth * tan_half_vertical
     half_width = half_height * aspect
 
     horizontal = abs(float(np.dot(relative, right)))
     vertical = abs(float(np.dot(relative, camera_up)))
 
     return (
-        horizontal <= half_width + radius
-        and vertical <= half_height + radius
+        horizontal <= half_width + horizontal_extent
+        and vertical <= half_height + vertical_extent
     )
 
-# Dynamic body buffer.
-body_buffer = ctx.buffer(reserve=NUM_BODIES * 7 * 4)
+def create_sphere_vertices(latitude_segments=16, longitude_segments=32):
+    vertices = []
+
+    def sphere_point(latitude, longitude):
+        return (
+            math.sin(latitude) * math.cos(longitude),
+            math.cos(latitude),
+            math.sin(latitude) * math.sin(longitude),
+        )
+
+    for latitude_index in range(latitude_segments):
+        latitude_start = math.pi * latitude_index / latitude_segments
+        latitude_end = math.pi * (latitude_index + 1) / latitude_segments
+
+        for longitude_index in range(longitude_segments):
+            longitude_start = (
+                2.0 * math.pi * longitude_index / longitude_segments
+            )
+            longitude_end = (
+                2.0 * math.pi * (longitude_index + 1) / longitude_segments
+            )
+            top_left = sphere_point(latitude_start, longitude_start)
+            bottom_left = sphere_point(latitude_end, longitude_start)
+            top_right = sphere_point(latitude_start, longitude_end)
+            bottom_right = sphere_point(latitude_end, longitude_end)
+
+            for point in (
+                top_left,
+                bottom_left,
+                top_right,
+                top_right,
+                bottom_left,
+                bottom_right,
+            ):
+                vertices.append((*point, *point))
+
+    return np.asarray(vertices, dtype=np.float32)
+
+
+sphere_vertices = create_sphere_vertices()
+sphere_buffer = ctx.buffer(sphere_vertices.tobytes())
+body_buffer = ctx.buffer(reserve=NUM_BODIES * 13 * 4)
+star_light_data = np.zeros((MAX_STAR_LIGHTS, 4), dtype=np.float32)
+star_light_color_data = np.zeros((MAX_STAR_LIGHTS, 4), dtype=np.float32)
 body_vao = ctx.vertex_array(
     body_program,
-    [(body_buffer, "3f 3f 1f",
-      "in_position", "in_color", "in_size")],
+    [
+        (
+            sphere_buffer,
+            "3f 3f",
+            "in_unit_position",
+            "in_unit_normal",
+        ),
+        (
+            body_buffer,
+            "3f 3f 1f 1f 3f 1f 1f /i",
+            "in_center",
+            "in_color",
+            "in_radius",
+            "in_is_star",
+            "in_rotation_axis",
+            "in_rotation_angle",
+            "in_is_gas",
+        ),
+    ],
 )
 
 # ============================================================
@@ -1465,38 +1892,114 @@ body_vao = ctx.vertex_array(
 
 trail_vaos = [None] * NUM_BODIES
 trail_buffers = [None] * NUM_BODIES
+trail_vertex_counts = np.zeros(NUM_BODIES, dtype=np.int32)
+MAX_TRAIL_VERTICES = 2 * (TRAIL_LENGTH + HISTORY_TRIM_BATCH) + 1
 last_trail_update = 0.0
 
-def update_trails():
-    global trail_vaos, trail_buffers
 
+def smooth_trail_points(points, samples_per_segment=2):
+    if len(points) < 3:
+        return points
+
+    p0 = np.vstack([points[0], points[:-2]])
+    p1 = points[:-1]
+    p2 = points[1:]
+    p3 = np.vstack([points[2:], points[-1]])
+    t = np.linspace(
+        0.0,
+        1.0,
+        samples_per_segment,
+        endpoint=False,
+        dtype=np.float32,
+    )[None, :, None]
+
+    segments = 0.5 * (
+        2.0 * p1[:, None, :]
+        + (-p0 + p2)[:, None, :] * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3)[:, None, :] * t**2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3)[:, None, :] * t**3
+    )
+    return np.vstack([
+        segments.reshape(-1, 3),
+        points[-1],
+    ])
+
+
+def trim_trail_at_body(points, center, body_radius):
+    trail_gap = body_radius * 1.03
+    distances = np.linalg.norm(points - center, axis=1)
+    outside_indices = np.flatnonzero(distances >= trail_gap)
+    if len(outside_indices) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    last_outside = int(outside_indices[-1])
+    if last_outside == len(points) - 1:
+        return points
+
+    segment_start = points[last_outside]
+    segment = points[last_outside + 1] - segment_start
+    relative_start = segment_start - center
+    quadratic_a = float(np.dot(segment, segment))
+    if quadratic_a < 1e-20:
+        return points[:last_outside + 1]
+
+    quadratic_b = 2.0 * float(np.dot(relative_start, segment))
+    quadratic_c = float(np.dot(relative_start, relative_start)) - trail_gap**2
+    discriminant = max(
+        quadratic_b**2 - 4.0 * quadratic_a * quadratic_c,
+        0.0,
+    )
+    intersection_fraction = (
+        -quadratic_b - math.sqrt(discriminant)
+    ) / (2.0 * quadratic_a)
+    intersection_fraction = float(np.clip(intersection_fraction, 0.0, 1.0))
+    intersection = segment_start + intersection_fraction * segment
+    intersection = center + (intersection - center) * 1.01
+
+    return np.vstack([
+        points[:last_outside + 1],
+        intersection.astype(np.float32),
+    ])
+
+
+def update_trails(displayed_positions, displayed_radii):
     for i in range(NUM_BODIES):
-        if trail_vaos[i] is not None:
-            trail_vaos[i].release()
-            trail_vaos[i] = None
-
-        if trail_buffers[i] is not None:
-            trail_buffers[i].release()
-            trail_buffers[i] = None
-
         if len(history[i]) < 2:
+            trail_vertex_counts[i] = 0
             continue
 
         points = np.array(
             [entry[1] for entry in history[i]],
             dtype=np.float32,
         )
-
-        color = np.array(body_colors[i], dtype=np.float32)
-        colors = np.tile(color, (len(points), 1))
-        data = np.hstack([points, colors]).astype(np.float32)
-
-        trail_buffers[i] = ctx.buffer(data.tobytes())
-        trail_vaos[i] = ctx.vertex_array(
-            line_program,
-            [(trail_buffers[i], "3f 3f",
-              "in_position", "in_color")],
+        points[-1] = displayed_positions[i]
+        points = smooth_trail_points(points)
+        points = trim_trail_at_body(
+            points,
+            displayed_positions[i],
+            float(displayed_radii[i]),
         )
+        if len(points) < 2:
+            trail_vertex_counts[i] = 0
+            continue
+
+        data = np.empty((len(points), 6), dtype=np.float32)
+        data[:, :3] = points
+        data[:, 3:] = body_colors[i]
+
+        if trail_buffers[i] is None:
+            trail_buffers[i] = ctx.buffer(
+                reserve=MAX_TRAIL_VERTICES * 6 * 4,
+                dynamic=True,
+            )
+            trail_vaos[i] = ctx.vertex_array(
+                line_program,
+                [(trail_buffers[i], "3f 3f",
+                  "in_position", "in_color")],
+            )
+
+        trail_buffers[i].write(data.tobytes())
+        trail_vertex_counts[i] = len(points)
 
 
 
@@ -1507,6 +2010,8 @@ def update_trails():
 
 
 camera_position = np.array([0.0, 0.0, 4.5], dtype=np.float64)
+camera_body_positions = positions.copy()
+camera_body_radii = collision_radii.copy()
 loaded_background_chunk = None
 travel_requests = SimpleQueue()
 camera_yaw = -math.pi / 2
@@ -1555,8 +2060,16 @@ def cursor_position_callback(window, x, y):
 def scroll_callback(window, x_offset, y_offset):
     global camera_position
 
+    constrain_camera_to_bodies(camera_body_positions, camera_body_radii)
+    start = camera_position.copy()
     forward = get_camera_forward()
-    camera_position += forward * y_offset * 0.5
+    candidate = start + forward * y_offset * 0.5
+    camera_position = resolve_camera_motion(
+        start,
+        candidate,
+        camera_body_positions,
+        camera_body_radii,
+    )
     
 def request_travel(sender, app_data, system_index):
     travel_requests.put(system_index)
@@ -1588,6 +2101,8 @@ def travel_to_system(system_index):
 def update_camera(delta_time):
     global camera_position
 
+    constrain_camera_to_bodies(camera_body_positions, camera_body_radii)
+    start = camera_position.copy()
     forward = get_camera_forward()
 
     world_up = np.array([0.0, 1.0, 0.0])
@@ -1617,7 +2132,76 @@ def update_camera(delta_time):
 
     if np.linalg.norm(movement) > 0:
         movement /= np.linalg.norm(movement)
-        camera_position += movement * camera_speed * delta_time
+        candidate = start + movement * camera_speed * delta_time
+        camera_position = resolve_camera_motion(
+            start,
+            candidate,
+            camera_body_positions,
+            camera_body_radii,
+        )
+
+
+def constrain_camera_to_bodies(centers, radii):
+    global camera_position
+
+    for body_index, (center, radius) in enumerate(zip(centers, radii)):
+        if body_index >= NUM_STARS and not show_planets:
+            continue
+
+        offset = camera_position - center
+        distance = float(np.linalg.norm(offset))
+        minimum_distance = radius + max(radius * 0.05, 1e-3)
+        if distance >= minimum_distance:
+            continue
+
+        if distance < 1e-12:
+            offset = -get_camera_forward()
+        else:
+            offset /= distance
+        camera_position = center + offset * minimum_distance
+
+
+def resolve_camera_motion(start, end, centers, radii):
+    displacement = end - start
+    displacement_squared = float(np.dot(displacement, displacement))
+    if displacement_squared < 1e-20:
+        return end
+
+    earliest_intersection = 1.0
+    displacement_length = math.sqrt(displacement_squared)
+    for body_index, (center, radius) in enumerate(zip(centers, radii)):
+        if body_index >= NUM_STARS and not show_planets:
+            continue
+
+        safe_radius = radius + max(radius * 0.05, 1e-3)
+        relative_start = start - center
+        quadratic_c = float(np.dot(relative_start, relative_start)) - safe_radius**2
+        quadratic_b = 2.0 * float(np.dot(relative_start, displacement))
+        if quadratic_c <= 1e-10:
+            if quadratic_b < 0.0:
+                earliest_intersection = 0.0
+            continue
+
+        discriminant = (
+            quadratic_b**2
+            - 4.0 * displacement_squared * quadratic_c
+        )
+        if discriminant < 0.0:
+            continue
+
+        intersection = (
+            -quadratic_b - math.sqrt(discriminant)
+        ) / (2.0 * displacement_squared)
+        if 0.0 <= intersection < earliest_intersection:
+            earliest_intersection = intersection
+
+    if earliest_intersection < 1.0:
+        safe_fraction = max(
+            0.0,
+            earliest_intersection - 1e-3 / displacement_length,
+        )
+        return start + displacement * safe_fraction
+    return end
 
 
 glfw.set_mouse_button_callback(window, mouse_button_callback)
@@ -1754,7 +2338,7 @@ def run_control_panel():
         )
 
         dpg.add_slider_float(
-            label="Star Size",
+            label="Star Size Exaggeration",
             min_value=0.25,
             max_value=4.0,
             default_value=star_scale,
@@ -1762,11 +2346,14 @@ def run_control_panel():
         )
 
         dpg.add_slider_float(
-            label="Planet Size",
+            label="Planet Size Exaggeration",
             min_value=0.25,
             max_value=4.0,
             default_value=planet_scale,
             callback=lambda s, a: set_planet_scale(a)
+        )
+        dpg.add_text(
+            "Display exaggeration is visual only; physics uses physical mass and volume."
         )
 
         dpg.add_separator()
@@ -1851,6 +2438,9 @@ last_frame_time = glfw.get_time()
 try:
     while not glfw.window_should_close(window):
         glfw.poll_events()
+        current_time = glfw.get_time()
+        delta_time = max(current_time - last_frame_time, 1e-6)
+        last_frame_time = current_time
 
         if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
             break
@@ -1861,16 +2451,14 @@ try:
         # ADVANCE ALL 13 BODIES
         # ==========================================
 
+        steps = max(1, int(STEPS_PER_FRAME * time_scale))
         if not paused:
-
-            steps = max(1, int(STEPS_PER_FRAME * time_scale))
-
             for _ in range(steps):
 
                 # Advance physics by one timestep
-                physics_step()
+                if not physics_step():
+                    break
                 
-       
                 simulation_years += DT
 
                 # Save trajectory history
@@ -1879,19 +2467,13 @@ try:
                         (simulation_years, positions[i].copy())
                     )
 
-                    if len(history[i]) > TRAIL_LENGTH:
-                        history[i].pop(0)
+                    if len(history[i]) > TRAIL_LENGTH + HISTORY_TRIM_BATCH:
+                        del history[i][:HISTORY_TRIM_BATCH]
 
         # ==========================================#
         # REFRESH TRAJECTORY BUFFERS
         # ==========================================#
 
-
-        now = time.time()
-
-        if now - last_trail_update >= TRAIL_UPDATE_INTERVAL:
-            update_trails()
-            last_trail_update = now
 
         # ==========================================
         # LIGHT-TRAVEL-TIME POSITIONS
@@ -1904,22 +2486,63 @@ try:
                 i, simulation_years, history
             )
 
-        displayed_sizes = body_sizes.copy()
-        displayed_sizes[:NUM_STARS] *= star_scale
-        displayed_sizes[NUM_STARS:] *= planet_scale
+        displayed_radii = (
+            collision_radii
+            * body_visual_exaggeration
+            * body_visual_scales
+        )
+        displayed_radii[:NUM_STARS] *= star_scale
+        displayed_radii[NUM_STARS:] *= planet_scale
+        camera_body_positions[:] = displayed_positions
+        camera_body_radii[:] = displayed_radii
+
+        now = time.time()
+        trail_update_interval = (
+            TRAIL_UPDATE_INTERVAL / max(time_scale, 1.0)
+        )
+        if now - last_trail_update >= trail_update_interval:
+            simulation_interval = (
+                DT * steps * trail_update_interval / delta_time
+                if not paused
+                else 0.0
+            )
+            trail_cut_radii = (
+                displayed_radii
+                + np.linalg.norm(velocities, axis=1) * simulation_interval
+            )
+            update_trails(displayed_positions, trail_cut_radii)
+            last_trail_update = now
+
+        rotation_angles = (
+            rotation_phases
+            + 2.0 * math.pi * simulation_years / rotation_period_years
+        ) % (2.0 * math.pi)
+
+        star_light_data.fill(0.0)
+        star_light_color_data.fill(0.0)
+        star_light_data[:NUM_STARS, :3] = displayed_positions[:NUM_STARS]
+        star_light_data[:NUM_STARS, 3] = (
+            np.maximum(masses[:NUM_STARS], MIN_MASS_SOLAR) ** 3.5
+        )
+        star_light_color_data[:NUM_STARS, :3] = np.asarray(
+            body_colors[:NUM_STARS],
+            dtype=np.float32,
+        )
 
         body_data = np.hstack([
             displayed_positions.astype(np.float32),
             np.array(body_colors, dtype=np.float32),
-            displayed_sizes[:, None],
+            displayed_radii[:, None].astype(np.float32),
+            body_is_star[:, None],
+            rotation_axes.astype(np.float32),
+            rotation_angles[:, None].astype(np.float32),
+            body_is_gas[:, None],
         ]).astype(np.float32)
 
         body_buffer.write(body_data.tobytes())
-        current_time = glfw.get_time()
-        delta_time = current_time - last_frame_time
-        last_frame_time = current_time
 
         update_camera(delta_time)
+        constrain_camera_to_bodies(displayed_positions, displayed_radii)
 
         # CAMERA
         
@@ -1935,11 +2558,22 @@ try:
         far_plane = max(
             200.0,
             float(np.max(np.linalg.norm(
-                positions - camera_position,
+                displayed_positions - camera_position,
                 axis=1,
-            ))) + 100.0,
+            ) + displayed_radii)) + 100.0,
         )
-        near_plane = max(0.01, far_plane * 1e-5)
+        visible_body_indices = (
+            slice(None) if show_planets else slice(0, NUM_STARS)
+        )
+        surface_clearances = (
+            np.linalg.norm(
+                displayed_positions[visible_body_indices] - camera_position,
+                axis=1,
+            )
+            - displayed_radii[visible_body_indices]
+        )
+        nearest_surface = max(float(np.min(surface_clearances)), 1e-5)
+        near_plane = max(1e-5, min(0.01, nearest_surface * 0.25))
 
         projection = perspective(
             60.0,
@@ -1959,7 +2593,11 @@ try:
 
         body_program["view"].write(view.T.astype("f4").tobytes())
         body_program["projection"].write(projection.T.astype("f4").tobytes())
-        body_program["viewport_height"].value = float(height)
+        body_program["star_count"].value = NUM_STARS
+        body_program["star_lights"].write(star_light_data.tobytes())
+        body_program["star_light_colors"].write(
+            star_light_color_data.tobytes()
+        )
 
         point_program["mvp"].write(mvp.T.astype("f4").tobytes())
         line_program["mvp"].write(mvp.T.astype("f4").tobytes())
@@ -2003,20 +2641,33 @@ try:
             ):
                 vao.render(
                     mode=moderngl.POINTS,
-                    vertices=STARS_PER_CHUNK,
+                    vertices=BACKGROUND_STAR_LOD_COUNT,
                 )
-
-        # Trajectory trails
-        if show_trails:
-            for i, vao in enumerate(trail_vaos):
-                if vao is not None and (show_planets or i < NUM_STARS):
-                    vao.render(mode=moderngl.LINE_STRIP)
 
         # Main bodies
         body_vao.render(
-            mode=moderngl.POINTS,
-            vertices=NUM_BODIES if show_planets else NUM_STARS,
+            mode=moderngl.TRIANGLES,
+            vertices=len(sphere_vertices),
+            instances=NUM_BODIES if show_planets else NUM_STARS,
         )
+
+        # Draw trails against the completed body depth buffer without changing it.
+        if show_trails:
+            ctx.depth_mask = False
+            try:
+                for i, vao in enumerate(trail_vaos):
+                    if (
+                        vao is not None
+                        and trail_vertex_counts[i] > 1
+                        and (show_planets or i < NUM_STARS)
+                    ):
+                        vao.render(
+                            mode=moderngl.LINE_STRIP,
+                            vertices=int(trail_vertex_counts[i]),
+                        )
+            finally:
+                ctx.depth_mask = True
+
         draw_system_labels(projection, view, width, height)
 
         glfw.swap_buffers(window)
@@ -2046,6 +2697,7 @@ finally:
 
     body_vao.release()
     body_buffer.release()
+    sphere_buffer.release()
     point_program.release()
     line_program.release()
     body_program.release()
