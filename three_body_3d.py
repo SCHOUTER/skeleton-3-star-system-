@@ -17,7 +17,7 @@ DT = 0.00001
 STEPS_PER_FRAME = 10
 TRAIL_LENGTH = 1800
 HISTORY_TRIM_BATCH = 128
-TRAIL_UPDATE_INTERVAL = 0.10
+TRAIL_UPDATE_INTERVAL = 0.025
 
 G = 4.0 * math.pi**2  # AU^3 / (solar mass * year^2)
 C_AU_PER_YEAR = 63241.077
@@ -1041,6 +1041,19 @@ def detect_collision(pos, previous_pos=None):
         return None
 
     return tuple(int(index) for index in colliding_pairs[0])
+#clipping fix 
+def limit_visual_overlap(centers, radii, floor_radii, gap=0.9):
+    """Shrink displayed radii so no two spheres overlap.
+    Never goes below the true physical radius."""
+    delta = centers[:, None, :] - centers[None, :, :]
+    dist = np.linalg.norm(delta, axis=2)
+    np.fill_diagonal(dist, np.inf)
+
+    radius_sum = np.maximum(radii[:, None] + radii[None, :], 1e-30)
+    pair_scale = np.minimum(1.0, gap * dist / radius_sum)
+    body_scale = pair_scale.min(axis=1)
+
+    return np.maximum(radii * body_scale, floor_radii)
 
 
 #body controls init for gui
@@ -1964,15 +1977,33 @@ def trim_trail_at_body(points, center, body_radius):
 
 def update_trails(displayed_positions, displayed_radii):
     for i in range(NUM_BODIES):
-        if len(history[i]) < 2:
+        hist = history[i]
+        if len(hist) < 2:
+            trail_vertex_counts[i] = 0
+            continue
+
+        delay = float(
+            np.linalg.norm(positions[i] - OBSERVER) / C_AU_PER_YEAR
+        )
+        target_time = simulation_years - delay
+        times = np.fromiter(
+            (entry[0] for entry in hist),
+            dtype=np.float64,
+            count=len(hist),
+        )
+        cut = int(np.searchsorted(times, target_time, side="right"))
+        if cut < 1:
             trail_vertex_counts[i] = 0
             continue
 
         points = np.array(
-            [entry[1] for entry in history[i]],
+            [entry[1] for entry in hist[:cut]],
             dtype=np.float32,
-        )
-        points[-1] = displayed_positions[i]
+        ).reshape(-1, 3)
+        points = np.vstack([
+            points,
+            displayed_positions[i].astype(np.float32),
+        ])
         points = smooth_trail_points(points)
         points = trim_trail_at_body(
             points,
@@ -1982,6 +2013,8 @@ def update_trails(displayed_positions, displayed_radii):
         if len(points) < 2:
             trail_vertex_counts[i] = 0
             continue
+
+       
 
         data = np.empty((len(points), 6), dtype=np.float32)
         data[:, :3] = points
@@ -2493,9 +2526,16 @@ try:
         )
         displayed_radii[:NUM_STARS] *= star_scale
         displayed_radii[NUM_STARS:] *= planet_scale
+
+        n_visible = NUM_BODIES if show_planets else NUM_STARS
+        displayed_radii[:n_visible] = limit_visual_overlap(
+            displayed_positions[:n_visible],
+            displayed_radii[:n_visible],
+            collision_radii[:n_visible],
+        )
+
         camera_body_positions[:] = displayed_positions
         camera_body_radii[:] = displayed_radii
-
         now = time.time()
         trail_update_interval = (
             TRAIL_UPDATE_INTERVAL / max(time_scale, 1.0)
