@@ -1,5 +1,4 @@
 import math
-import threading
 import time
 from queue import SimpleQueue
 
@@ -128,7 +127,7 @@ float hash3(vec3 point) {
     return fract(sin(dot(point, vec3(127.1, 311.7, 74.7))) * 43758.5453);
 }
 
-float noise3(vec3 point) {
+float value_noise3(vec3 point) {
     vec3 cell = floor(point);
     vec3 f = fract(point);
     f = f * f * (3.0 - 2.0 * f);
@@ -144,7 +143,7 @@ float fbm3(vec3 p) {
     float value = 0.0;
     float amplitude = 0.5;
     for (int i = 0; i < 4; i++) {
-        value += amplitude * noise3(p);
+        value += amplitude * value_noise3(p);
         p = p * 2.0 + vec3(13.7, 9.2, 5.3);
         amplitude *= 0.5;
     }
@@ -283,9 +282,9 @@ vec3 bump_normal(vec3 n, vec3 s, float scale, float strength) {
     float e = 0.01;
     vec3 sp = s * scale;
     vec3 g = vec3(
-        noise3(sp + vec3(e, 0.0, 0.0)) - noise3(sp - vec3(e, 0.0, 0.0)),
-        noise3(sp + vec3(0.0, e, 0.0)) - noise3(sp - vec3(0.0, e, 0.0)),
-        noise3(sp + vec3(0.0, 0.0, e)) - noise3(sp - vec3(0.0, 0.0, e))
+        value_noise3(sp + vec3(e, 0.0, 0.0)) - value_noise3(sp - vec3(e, 0.0, 0.0)),
+        value_noise3(sp + vec3(0.0, e, 0.0)) - value_noise3(sp - vec3(0.0, e, 0.0)),
+        value_noise3(sp + vec3(0.0, 0.0, e)) - value_noise3(sp - vec3(0.0, 0.0, e))
     ) / (2.0 * e);
     g = rotate_around_axis(g, body_rotation_axis, body_angle);
     g -= n * dot(g, n);
@@ -304,9 +303,9 @@ void main() {
     // ---------------- STARS ----------------
     if (body_is_star > 0.5) {
         float t = time * 0.15;
-        float gran = 0.6 * noise3(s * 30.0 + vec3(t))
-                   + 0.4 * noise3(s * 70.0 - vec3(t * 1.7));
-        float spots = smoothstep(0.72, 0.88, noise3(s * 7.0 + vec3(seed)));
+        float gran = 0.6 * value_noise3(s * 30.0 + vec3(t))
+                   + 0.4 * value_noise3(s * 70.0 - vec3(t * 1.7));
+        float spots = smoothstep(0.72, 0.88, value_noise3(s * 7.0 + vec3(seed)));
         vec3 hot = albedo * (0.8 + 0.5 * gran) * (1.0 - 0.35 * spots);
 
         // Limb darkening: edges are cooler and redder.
@@ -329,8 +328,8 @@ void main() {
         // ---------------- GAS GIANTS ----------------
         float lat = dot(s, axis);
         float warp = fbm3(s * 3.0 + vec3(seed));
-        float coarse = noise3(vec3(lat * 6.0 + warp * 1.4, seed, 1.0));
-        float fine = noise3(vec3(lat * 17.0 + warp * 2.2, seed + 4.0, 2.0));
+        float coarse = value_noise3(vec3(lat * 6.0 + warp * 1.4, seed, 1.0));
+        float fine = value_noise3(vec3(lat * 17.0 + warp * 2.2, seed + 4.0, 2.0));
 
         vec3 band_a = albedo;
         vec3 band_b = hue_shift(albedo, 0.45 + fract(seed * 5.1) * 0.6) * 0.65;
@@ -339,7 +338,7 @@ void main() {
         vec3 gas = mix(band_a, band_b, smoothstep(0.35, 0.65, coarse));
         gas = mix(gas, band_c, smoothstep(0.55, 0.85, fine) * 0.7);
 
-        float storm = smoothstep(0.66, 0.80, noise3(s * vec3(4.0, 8.0, 4.0) + vec3(seed)));
+        float storm = smoothstep(0.66, 0.80, value_noise3(s * vec3(4.0, 8.0, 4.0) + vec3(seed)));
         storm *= 1.0 - abs(lat);
         gas = mix(gas, hue_shift(albedo, 2.6) * 1.15, storm * 0.6);
 
@@ -1796,10 +1795,24 @@ label_program = ctx.program(
 label_program["label_texture"].value = 0
 label_vao = ctx.vertex_array(label_program, [])
 
-label_font = ImageFont.truetype(
-    r"C:\Windows\Fonts\arialbd.ttf",
-    18,
-)
+
+def load_label_font(size: int) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    """Load a system font on Windows/macOS/Linux"""
+    for font_path in (
+        r"C:\Windows\Fonts\arialbd.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(font_path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size)
+
+
+label_font = load_label_font(18)
 
 system_label_textures = []
 
@@ -2501,15 +2514,25 @@ def run_control_panel():
                         body_index,
                         planet_names[planet_index],
                     )
-    dpg.create_viewport(title="Simulation Controls", width=470, height=850)
+    dpg.create_viewport(title="Simulation Controls", width=470, height=850, vsync=False)
 
     dpg.setup_dearpygui()
     dpg.show_viewport()
+    glfw.make_context_current(window)
 
-    while dpg.is_dearpygui_running():
-        dpg.render_dearpygui_frame()
 
-    dpg.destroy_context()
+def render_control_panel_frame():
+    """Draw control-panel frame"""
+    global control_panel_open
+
+    if not control_panel_open:
+        return
+    if not dpg.is_dearpygui_running():
+        control_panel_open = False
+        return
+
+    dpg.render_dearpygui_frame()
+    glfw.make_context_current(window)
 
 
 def set_time_scale(value):
@@ -2538,11 +2561,10 @@ def set_show_trails(value):
 
 
 # ============================================================
-# console thread
+# control panel (macOS forbids NSWindow on not main threads)
 # ============================================================
-control_thread = threading.Thread(target=run_control_panel, daemon=True)
-
-control_thread.start()
+run_control_panel()
+control_panel_open = True
 # frame pass
 last_frame_time = glfw.get_time()
 # ============================================================
@@ -2551,6 +2573,7 @@ last_frame_time = glfw.get_time()
 try:
     while not glfw.window_should_close(window):
         glfw.poll_events()
+        render_control_panel_frame()
         current_time = glfw.get_time()
         delta_time = max(current_time - last_frame_time, 1e-6)
         last_frame_time = current_time
@@ -2798,5 +2821,6 @@ finally:
     body_program.release()
     ctx.release()
 
+    dpg.destroy_context()
     glfw.destroy_window(window)
     glfw.terminate()
