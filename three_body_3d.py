@@ -2,7 +2,6 @@ import math
 import os
 import sys
 import time
-from queue import SimpleQueue
 
 import dearpygui.dearpygui as dpg
 import glfw
@@ -2528,7 +2527,6 @@ camera_position = np.array([0.0, 0.0, 4.5], dtype=np.float64)
 camera_body_positions = positions.copy()
 camera_body_radii = collision_radii.copy()
 loaded_background_chunk = None
-travel_requests = SimpleQueue()
 camera_yaw = -math.pi / 2
 camera_pitch = 0.0
 
@@ -2632,10 +2630,6 @@ def scroll_callback(window, x_offset, y_offset):
         camera_body_positions,
         camera_body_radii,
     )
-
-
-def request_travel(sender, app_data, system_index):
-    travel_requests.put(system_index)
 
 
 def travel_to_system(system_index):
@@ -2901,7 +2895,7 @@ def build_system_sections():
         ):
             dpg.add_button(
                 label="Travel to system",
-                callback=request_travel,
+                callback=lambda s, a, u: travel_to_system(u),
                 user_data=system_index,
             )
             for star_index in system_star_indices[system_index]:
@@ -2912,6 +2906,8 @@ def build_system_sections():
 
 def run_control_panel():
     dpg.create_context()
+    # Callbacks are queued and run from render_control_panel_frame, on the main thread.
+    dpg.configure_app(manual_callback_management=True)
     build_theme()
     build_font()
 
@@ -2928,7 +2924,7 @@ def run_control_panel():
 
 
 def render_control_panel_frame():
-    """Draw control-panel frame"""
+    """Run queued panel callbacks, then draw one panel frame."""
     global control_panel_open
 
     if not control_panel_open:
@@ -2937,6 +2933,7 @@ def render_control_panel_frame():
         control_panel_open = False
         return
 
+    dpg.run_callbacks(dpg.get_callback_queue())
     dpg.render_dearpygui_frame()
     glfw.make_context_current(window)
 
@@ -2989,8 +2986,6 @@ try:
         ):
             last_escape_press = -math.inf
             glfw.set_window_title(window, WINDOW_TITLE)
-        while not travel_requests.empty():
-            travel_to_system(travel_requests.get())
 
         # ==========================================
         # ADVANCE ALL 13 BODIES
