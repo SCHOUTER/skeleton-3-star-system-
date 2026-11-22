@@ -1514,67 +1514,64 @@ def add_body_controls(body_index, body_name):
 
 # ============================================================
 # POSITION HISTORY (light delay and trails)
+# Recent steps for all bodies, oldest first. When the buffer is full the
+# oldest HISTORY_TRIM_BATCH entries are dropped in one shift.
 # ============================================================
 
 OBSERVER = np.array([0.0, 0.0, -100.0])
-history = [[] for _ in range(NUM_BODIES)]
+HISTORY_CAPACITY = TRAIL_LENGTH + HISTORY_TRIM_BATCH
+history_times = np.zeros(HISTORY_CAPACITY)
+history_positions = np.zeros((HISTORY_CAPACITY, NUM_BODIES, 3))
+history_length = 0
 simulation_years = 0.0
 
 
 def record_history():
-    snapshot = positions.copy()
-    for i in range(NUM_BODIES):
-        history[i].append((simulation_years, snapshot[i]))
-        if len(history[i]) > TRAIL_LENGTH + HISTORY_TRIM_BATCH:
-            del history[i][:HISTORY_TRIM_BATCH]
+    global history_length
 
-
-def forget_history(body_index):
-    """Restart one body's history at its current position (after a teleport)."""
-    history[body_index].clear()
-    history[body_index].append((simulation_years, positions[body_index].copy()))
+    if history_length == HISTORY_CAPACITY:
+        keep = HISTORY_CAPACITY - HISTORY_TRIM_BATCH
+        history_times[:keep] = history_times[HISTORY_TRIM_BATCH:]
+        history_positions[:keep] = history_positions[HISTORY_TRIM_BATCH:]
+        history_length = keep
+    history_times[history_length] = simulation_years
+    history_positions[history_length] = positions
+    history_length += 1
 
 
 def reset_history():
-    for i in range(NUM_BODIES):
-        forget_history(i)
+    global history_length
+
+    history_times[0] = simulation_years
+    history_positions[0] = positions
+    history_length = 1
 
 
-def light_delayed_time(body_index):
-    """The time whose light from this body reaches OBSERVER now."""
-    distance = np.linalg.norm(positions[body_index] - OBSERVER)
-    return simulation_years - distance / C_AU_PER_YEAR
+def forget_history(body_index):
+    """Collapse one body's history onto its current position (after a teleport)."""
+    history_positions[:history_length, body_index] = positions[body_index]
 
 
-def apparent_position(body_index):
-    """Retarded position of one body, interpolated from its history."""
-    body_history = history[body_index]
-    if len(body_history) < 2:
-        return positions[body_index]
-
-    target_time = light_delayed_time(body_index)
-    if target_time <= body_history[0][0]:
-        return body_history[0][1]
-    if target_time >= body_history[-1][0]:
-        return positions[body_index]
-
-    low = 0
-    high = len(body_history) - 1
-    while high - low > 1:
-        middle = (low + high) // 2
-        if body_history[middle][0] <= target_time:
-            low = middle
-        else:
-            high = middle
-
-    time_a, position_a = body_history[low]
-    time_b, position_b = body_history[high]
-    fraction = (target_time - time_a) / (time_b - time_a)
-    return position_a + (position_b - position_a) * fraction
+def light_delayed_times():
+    """Per body, the time whose light reaches OBSERVER now."""
+    return simulation_years - np.linalg.norm(positions - OBSERVER, axis=1) / C_AU_PER_YEAR
 
 
 def apparent_positions():
-    return np.array([apparent_position(i) for i in range(NUM_BODIES)])
+    """Positions as seen from OBSERVER (retarded by light travel time), from the history."""
+    if history_length < 2:
+        return positions.copy()
+
+    times = history_times[:history_length]
+    target = light_delayed_times()
+    high = np.clip(np.searchsorted(times, target, side="right"), 1, history_length - 1)
+    low = high - 1
+    span = times[high] - times[low]
+    fraction = np.clip((target - times[low]) / np.where(span > 0.0, span, 1.0), 0.0, 1.0)
+
+    bodies = np.arange(NUM_BODIES)
+    start = history_positions[low, bodies]
+    return start + (history_positions[high, bodies] - start) * fraction[:, None]
 
 
 reset_history()
@@ -2023,7 +2020,7 @@ body_vao = ctx.vertex_array(
 trail_vaos = [None] * NUM_BODIES
 trail_buffers = [None] * NUM_BODIES
 trail_vertex_counts = np.zeros(NUM_BODIES, dtype=np.int32)
-MAX_TRAIL_VERTICES = 2 * (TRAIL_LENGTH + HISTORY_TRIM_BATCH) + 1
+MAX_TRAIL_VERTICES = 2 * HISTORY_CAPACITY + 1
 last_trail_update = 0.0
 
 
@@ -2084,19 +2081,14 @@ def trim_trail_at_body(points, center, body_radius):
 
 def update_trails(displayed_positions, displayed_radii):
     """Rebuild trail vertex buffers from the light-delayed part of the history."""
+    cuts = np.searchsorted(history_times[:history_length], light_delayed_times(), side="right")
+
     for i in range(visible_body_count()):
         trail_vertex_counts[i] = 0
-        body_history = history[i]
-        if len(body_history) < 2:
+        if history_length < 2 or cuts[i] < 1:
             continue
 
-        times = np.fromiter((entry[0] for entry in body_history), dtype=np.float64)
-        cut = int(np.searchsorted(times, light_delayed_time(i), side="right"))
-        if cut < 1:
-            continue
-
-        points = np.array([entry[1] for entry in body_history[:cut]]).reshape(-1, 3)
-        points = np.vstack([points, displayed_positions[i]])
+        points = np.vstack([history_positions[: cuts[i], i], displayed_positions[i]])
         points = smooth_trail_points(points.astype(np.float32))
         points = trim_trail_at_body(points, displayed_positions[i], float(displayed_radii[i]))
         if len(points) < 2:
