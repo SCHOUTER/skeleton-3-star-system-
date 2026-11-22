@@ -29,6 +29,7 @@ star_scale = 1.0
 planet_scale = 1.0
 show_planets = True
 show_trails = True
+control_panel_open = False
 
 # Control panel palette (RGBA). Every fill behind text keeps >= 4.5:1 contrast with HUD_TEXT.
 HUD_TEXT = (190, 225, 235, 255)
@@ -1249,7 +1250,7 @@ def set_timestep(value):
 
 
 def physics_step():
-    global positions, velocities, paused, cached_acceleration
+    global cached_acceleration
 
     previous_positions = positions.copy()
     previous_velocities = velocities.copy()
@@ -1264,10 +1265,8 @@ def physics_step():
         positions[:] = previous_positions
         velocities[:] = previous_velocities
         cached_acceleration = a0
-        print(
-            f"COLLISION! Simulation stopped before overlap between Body {body_a} and Body {body_b}."
-        )
-        paused = True
+        set_paused(True)
+        show_status(f"Collision: body {body_a} and body {body_b}. Paused before overlap.")
         return False
 
     cached_acceleration = a_end
@@ -1585,7 +1584,7 @@ def set_body_value(sender, app_data, user_data):
 
     elif property_name == "mass":
         if not math.isfinite(app_data) or app_data < MIN_MASS_SOLAR:
-            print(f"Mass must be finite and at least {MIN_MASS_SOLAR:g} solar masses.")
+            show_status(f"Mass must be finite and at least {MIN_MASS_SOLAR:g} solar masses.")
             dpg.set_value(sender, float(masses[body_index]))
             return
 
@@ -1612,7 +1611,7 @@ def set_body_value(sender, app_data, user_data):
 
     elif property_name == "volume":
         if not math.isfinite(app_data) or app_data < MIN_VOLUME_KM3:
-            print(f"Volume must be finite and at least {MIN_VOLUME_KM3:g} km³.")
+            show_status(f"Volume must be finite and at least {MIN_VOLUME_KM3:g} km³.")
             dpg.set_value(
                 sender,
                 float(
@@ -1639,7 +1638,9 @@ def set_body_value(sender, app_data, user_data):
 
     elif property_name == "size":
         if not math.isfinite(app_data) or app_data < MIN_VISUAL_SCALE:
-            print(f"Visual radius multiplier must be finite and at least {MIN_VISUAL_SCALE:g}.")
+            show_status(
+                f"Visual radius multiplier must be finite and at least {MIN_VISUAL_SCALE:g}."
+            )
             dpg.set_value(sender, float(body_visual_scales[body_index]))
             return
 
@@ -1647,7 +1648,9 @@ def set_body_value(sender, app_data, user_data):
 
     elif property_name == "rotation_period":
         if not math.isfinite(app_data) or app_data < MIN_ROTATION_PERIOD_DAYS:
-            print(f"Rotation period must be finite and at least {MIN_ROTATION_PERIOD_DAYS:g} days.")
+            show_status(
+                f"Rotation period must be finite and at least {MIN_ROTATION_PERIOD_DAYS:g} days."
+            )
             dpg.set_value(
                 sender,
                 float(rotation_period_years[body_index] * 365.25),
@@ -1719,6 +1722,7 @@ def reset_simulation():
         )
 
     dpg.set_item_label("pause_button", "Pause (P)")
+    show_status("")
 
     # Trail buffers are refreshed by the main/render thread on its next update.
     last_trail_update = 0.0
@@ -2579,12 +2583,23 @@ def cursor_enter_callback(window, entered):
         sync_mouse_down(window)
 
 
-def toggle_pause():
+def set_paused(value):
     global paused
 
-    paused = not paused
+    paused = value
     if control_panel_open:
         dpg.set_item_label("pause_button", "Resume (P)" if paused else "Pause (P)")
+
+
+def toggle_pause():
+    set_paused(not paused)
+
+
+def show_status(message):
+    if message:
+        print(message)
+    if control_panel_open:
+        dpg.set_value("status_text", message)
 
 
 def key_callback(window, key, scancode, action, mods):
@@ -2793,6 +2808,7 @@ def build_font():
 def build_global_controls():
     dpg.add_button(label="Reset Simulation", callback=reset_simulation)
     dpg.add_button(label="Pause (P)", tag="pause_button", callback=toggle_pause)
+    dpg.add_text("", tag="status_text", color=HUD_ACCENT_ACTIVE, wrap=0)
     dpg.add_text(
         "Camera: drag left mouse to look, W/A/S/D move, Space up, Ctrl down, "
         "scroll to zoom. P pause, Esc twice to quit.",
