@@ -2115,7 +2115,7 @@ glfw.window_hint(glfw.SAMPLES, 8)
 glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
 glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
 
-WINDOW_TITLE = "Three Stars + Ten Planets"
+WINDOW_TITLE = "N-body Star Systems"
 window = glfw.create_window(WIDTH, HEIGHT, WINDOW_TITLE, None, None)
 
 if not window:
@@ -3204,7 +3204,13 @@ try:
 
         glfw.swap_buffers(window)
 
-        glfw.set_window_title(window, f"Three Stars + Ten Planets | {simulation_years:.5f} years")
+        # Rewritten every frame, so the pending-Esc hint must be part of it.
+        escape_hint = " - press Esc again to quit" if math.isfinite(last_escape_press) else ""
+        glfw.set_window_title(
+            window,
+            f"{WINDOW_TITLE} | {NUM_STARS} stars, {NUM_PLANETS} planets"
+            f" | t = {simulation_years:.5f} yr{escape_hint}",
+        )
 
 finally:
     for texture, _ in system_label_textures:
