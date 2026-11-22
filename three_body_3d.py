@@ -1396,6 +1396,164 @@ def detect_collision(pos, previous_pos=None):
     return tuple(int(index) for index in colliding_pairs[0])
 
 
+# ============================================================
+# SCENARIOS
+# Classic three-body initial conditions for the central trinary. Values from
+# the literature use G = 1; in G = 4 pi^2 units the same positions and masses
+# need velocities scaled by 2 pi (and times divided by 2 pi).
+# The trinary's planets are moved onto circular orbits around the stars'
+# centre of mass, far enough out to act as near-test particles.
+# ============================================================
+
+TRINARY_STARS = list(system_star_indices[0])
+TRINARY_PLANETS = list(system_planet_indices[0])
+TRINARY_BODIES = TRINARY_STARS + [NUM_STARS + p for p in TRINARY_PLANETS]
+GOLDEN_ANGLE = 2.399963229728653
+SQRT_G = 2.0 * math.pi
+
+
+def figure_eight_stars():
+    # Chenciner & Montgomery (2000); period 6.32591398 (G = 1) = 1.00680 yr here.
+    x1 = np.array([0.97000436, -0.24308753, 0.0])
+    v3 = SQRT_G * np.array([-0.93240737, -0.86473146, 0.0])
+    return np.array([x1, -x1, np.zeros(3)]), np.array([-v3 / 2, -v3 / 2, v3]), np.ones(3)
+
+
+def lagrange_triangle_stars(side=1.5):
+    # Equilateral rigid rotation, omega^2 = G M_total / side^3. Unstable for equal masses.
+    masses_ = np.ones(3)
+    radius = side / math.sqrt(3.0)
+    omega = math.sqrt(G * masses_.sum() / side**3)
+    angles = np.radians([90.0, 210.0, 330.0])
+    pos = radius * np.stack([np.cos(angles), np.sin(angles), np.zeros(3)], axis=1)
+    vel = omega * radius * np.stack([-np.sin(angles), np.cos(angles), np.zeros(3)], axis=1)
+    return pos, vel, masses_
+
+
+def hierarchical_triple_stars(inner=0.4, outer=5.0, inclination_deg=20.0):
+    # Tight 1.0 + 0.8 binary orbited by a 1.2 star; stable (outer/inner ratio 12.5).
+    m = np.array([1.0, 0.8, 1.2])
+    m_in, m_tot = m[0] + m[1], m.sum()
+    x_hat = np.array([1.0, 0.0, 0.0])
+    y_hat = np.array([0.0, 1.0, 0.0])
+    tilt = math.radians(inclination_deg)
+    outer_dir = np.array([0.0, math.cos(tilt), math.sin(tilt)])
+
+    v_in = math.sqrt(G * m_in / inner)
+    v_out = math.sqrt(G * m_tot / outer)
+    binary_pos = -(m[2] / m_tot) * outer * x_hat
+    binary_vel = -(m[2] / m_tot) * v_out * outer_dir
+
+    pos = np.array(
+        [
+            binary_pos - (m[1] / m_in) * inner * x_hat,
+            binary_pos + (m[0] / m_in) * inner * x_hat,
+            (m_in / m_tot) * outer * x_hat,
+        ]
+    )
+    vel = np.array(
+        [
+            binary_vel - (m[1] / m_in) * v_in * y_hat,
+            binary_vel + (m[0] / m_in) * v_in * y_hat,
+            (m_in / m_tot) * v_out * outer_dir,
+        ]
+    )
+    return pos, vel, m
+
+
+def pythagorean_stars():
+    # Burrau (1913): masses 3:4:5 at rest on a 3-4-5 triangle (scaled to 0.6:0.8:1.0).
+    # Very close encounters: a fixed timestep fails here (watch |dE/E0|).
+    pos = np.array([[1.0, 3.0, 0.0], [-2.0, -1.0, 0.0], [1.0, -1.0, 0.0]])
+    return pos, np.zeros((3, 3)), np.array([0.6, 0.8, 1.0])
+
+
+SCENARIO_BUILDERS = {
+    "Figure-8 (periodic)": (figure_eight_stars, (4.0, 12.0)),
+    "Lagrange triangle (unstable)": (lagrange_triangle_stars, (4.0, 12.0)),
+    "Hierarchical triple (stable)": (hierarchical_triple_stars, (12.0, 22.0)),
+    "Pythagorean (stress test)": (pythagorean_stars, (4.0, 12.0)),
+}
+
+SCENARIO_NOTES = {
+    "Original (chaotic)": "Arbitrary start: chaotic, planets scatter quickly.",
+    "Figure-8 (periodic)": "Equal masses on one figure-eight; repeats every 1.0068 yr.",
+    "Lagrange triangle (unstable)": "Rigid rotating triangle; tiny perturbations break it up.",
+    "Hierarchical triple (stable)": "Binary (P = 0.19 yr) + outer star (P = 6.45 yr).",
+    "Pythagorean (stress test)": "Close encounters; fixed dt fails by ~3 yr. Watch |dE/E0|.",
+}
+
+
+def circular_planet_orbits(radii, central_mass):
+    """Near-coplanar circular orbits around the origin, spread by the golden angle."""
+    pos, vel = [], []
+    for i, radius in enumerate(radii):
+        angle = i * GOLDEN_ANGLE
+        inclination = math.radians((i - 4.5) * 2.0)
+        radial = np.array(
+            [
+                math.cos(angle),
+                math.sin(angle) * math.cos(inclination),
+                math.sin(angle) * math.sin(inclination),
+            ]
+        )
+        tangent = np.array(
+            [
+                -math.sin(angle),
+                math.cos(angle) * math.cos(inclination),
+                math.cos(angle) * math.sin(inclination),
+            ]
+        )
+        pos.append(radius * radial)
+        vel.append(math.sqrt(G * central_mass / radius) * tangent)
+    return np.array(pos), np.array(vel)
+
+
+def build_scenario(name):
+    """Full-system (positions, velocities, masses, trinary planet radii) for a scenario."""
+    pos, vel, mass = initial_positions.copy(), initial_velocities.copy(), initial_masses.copy()
+    planet_radii = planet_orbit_radii[TRINARY_PLANETS].copy()
+    if name not in SCENARIO_BUILDERS:
+        return pos, vel, mass, planet_radii
+
+    builder, (r_in, r_out) = SCENARIO_BUILDERS[name]
+    star_pos, star_vel, star_mass = builder()
+    planet_radii = np.geomspace(r_in, r_out, len(TRINARY_PLANETS))
+    planet_pos, planet_vel = circular_planet_orbits(planet_radii, float(star_mass.sum()))
+
+    bodies = np.asarray(TRINARY_BODIES, dtype=np.intp)
+    old_com_pos = np.average(pos[bodies], axis=0, weights=mass[bodies])
+    old_com_vel = np.average(vel[bodies], axis=0, weights=mass[bodies])
+
+    mass[TRINARY_STARS] = star_mass
+    pos[bodies] = np.vstack([star_pos, planet_pos])
+    vel[bodies] = np.vstack([star_vel, planet_vel])
+
+    # Keep the trinary where it was in the galaxy, then zero total momentum again.
+    pos[bodies] += old_com_pos - np.average(pos[bodies], axis=0, weights=mass[bodies])
+    vel[bodies] += old_com_vel - np.average(vel[bodies], axis=0, weights=mass[bodies])
+    vel -= np.sum(mass[:, None] * vel, axis=0) / np.sum(mass)
+    return pos, vel, mass, planet_radii
+
+
+SCENARIO_NAMES = ["Original (chaotic)", *SCENARIO_BUILDERS]
+scenarios = {name: build_scenario(name) for name in SCENARIO_NAMES}
+scenario_name = SCENARIO_NAMES[0]
+
+
+def apply_scenario(name):
+    """Load a scenario as the new initial state and restart from it."""
+    global scenario_name
+    scenario_name = name
+    pos, vel, mass, planet_radii = scenarios[name]
+    initial_positions[:] = pos
+    initial_velocities[:] = vel
+    initial_masses[:] = mass
+    planet_orbit_radii[TRINARY_PLANETS] = planet_radii
+    reset_simulation()
+    dpg.set_value("scenario_note", SCENARIO_NOTES[name])
+
+
 # clipping fix
 def limit_visual_overlap(centers, radii, floor_radii, gap=0.9):
     """Shrink displayed radii so no two spheres overlap.
@@ -2648,6 +2806,14 @@ def build_global_controls():
     )
     dpg.add_separator()
 
+    dpg.add_combo(
+        SCENARIO_NAMES,
+        label="Scenario",
+        default_value=scenario_name,
+        width=PANEL_INPUT_WIDTH,
+        callback=lambda s, a: apply_scenario(a),
+    )
+    dpg.add_text(SCENARIO_NOTES[scenario_name], tag="scenario_note", wrap=0)
     dpg.add_combo(
         list(INTEGRATORS),
         label="Integrator",
