@@ -1172,6 +1172,83 @@ def invalidate_physics_cache():
     diagnostics_rebaseline = True
 
 
+# ============================================================
+# INTEGRATORS
+# Each advances pos/vel in place by dt. a_start is the acceleration at the
+# incoming positions; the return value is the acceleration at the outgoing
+# positions, or None when the method does not produce it.
+# ============================================================
+
+
+def step_euler(pos, vel, dt, a_start):
+    # Explicit Euler: 1st order, energy grows without bound.
+    pos += vel * dt
+    vel += a_start * dt
+    return None
+
+
+def step_symplectic_euler(pos, vel, dt, a_start):
+    # Kick then drift: 1st order but symplectic, so energy error stays bounded.
+    vel += a_start * dt
+    pos += vel * dt
+    return None
+
+
+def step_verlet(pos, vel, dt, a_start):
+    # Velocity Verlet (kick-drift-kick): 2nd order, symplectic, time-reversible.
+    vel += 0.5 * a_start * dt
+    pos += vel * dt
+    a_end = acceleration(pos)
+    vel += 0.5 * a_end * dt
+    return a_end
+
+
+def step_rk4(pos, vel, dt, a_start):
+    # Classic Runge-Kutta: 4th order, but not symplectic -> slow secular energy drift.
+    x0, v0 = pos.copy(), vel.copy()
+    k2x, k2v = v0 + 0.5 * dt * a_start, acceleration(x0 + 0.5 * dt * v0)
+    k3x, k3v = v0 + 0.5 * dt * k2v, acceleration(x0 + 0.5 * dt * k2x)
+    k4x, k4v = v0 + dt * k3v, acceleration(x0 + dt * k3x)
+    pos[:] = x0 + dt / 6.0 * (v0 + 2.0 * k2x + 2.0 * k3x + k4x)
+    vel[:] = v0 + dt / 6.0 * (a_start + 2.0 * k2v + 2.0 * k3v + k4v)
+    return None
+
+
+YOSHIDA_W1 = 1.0 / (2.0 - 2.0 ** (1.0 / 3.0))
+YOSHIDA_W0 = 1.0 - 2.0 * YOSHIDA_W1
+
+
+def step_yoshida4(pos, vel, dt, a_start):
+    # Yoshida (1990): three Verlet sub-steps (one backwards) give 4th order, still symplectic.
+    a = a_start
+    for weight in (YOSHIDA_W1, YOSHIDA_W0, YOSHIDA_W1):
+        a = step_verlet(pos, vel, weight * dt, a)
+    return a
+
+
+INTEGRATORS = {
+    "Euler (1st order)": step_euler,
+    "Symplectic Euler (1st order)": step_symplectic_euler,
+    "Velocity Verlet (2nd order)": step_verlet,
+    "RK4 (4th order, non-symplectic)": step_rk4,
+    "Yoshida (4th order, symplectic)": step_yoshida4,
+}
+integrator_name = "Velocity Verlet (2nd order)"
+TIMESTEP_OPTIONS = ["1e-06", "3e-06", "1e-05", "3e-05", "1e-04"]
+
+
+def set_integrator(value):
+    global integrator_name
+    integrator_name = value
+    invalidate_physics_cache()
+
+
+def set_timestep(value):
+    global DT
+    DT = float(value)
+    invalidate_physics_cache()
+
+
 def physics_step():
     global positions, velocities, paused, cached_acceleration
 
@@ -1179,8 +1256,7 @@ def physics_step():
     previous_velocities = velocities.copy()
 
     a0 = cached_acceleration if cached_acceleration is not None else acceleration(positions)
-    velocities += 0.5 * a0 * DT
-    positions += velocities * DT
+    a_end = INTEGRATORS[integrator_name](positions, velocities, DT, a0)
 
     collision = detect_collision(positions, previous_positions)
 
@@ -1195,9 +1271,7 @@ def physics_step():
         paused = True
         return False
 
-    a1 = acceleration(positions)
-    velocities += 0.5 * a1 * DT
-    cached_acceleration = a1
+    cached_acceleration = a_end
     return True
 
 
@@ -2574,6 +2648,20 @@ def build_global_controls():
     )
     dpg.add_separator()
 
+    dpg.add_combo(
+        list(INTEGRATORS),
+        label="Integrator",
+        default_value=integrator_name,
+        width=PANEL_INPUT_WIDTH,
+        callback=lambda s, a: set_integrator(a),
+    )
+    dpg.add_combo(
+        TIMESTEP_OPTIONS,
+        label="Timestep dt (yr)",
+        default_value=f"{DT:.0e}",
+        width=PANEL_INPUT_WIDTH,
+        callback=lambda s, a: set_timestep(a),
+    )
     dpg.add_slider_float(
         label="Time Speed",
         min_value=0.1,
@@ -2628,7 +2716,7 @@ def build_diagnostics():
         dpg.add_text("", tag="diag_momentum")
         dpg.add_text("", tag="diag_angular_error")
         dpg.add_text(
-            "Baseline resets after Reset or any body edit.",
+            "Baseline resets after Reset, any body edit, or an integrator/timestep change.",
             wrap=0,
         )
         with dpg.plot(label="Relative energy error", height=180, width=-1):
