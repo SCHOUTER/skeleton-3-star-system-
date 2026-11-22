@@ -1,4 +1,6 @@
 import math
+import os
+import sys
 import time
 from queue import SimpleQueue
 
@@ -28,6 +30,38 @@ star_scale = 1.0
 planet_scale = 1.0
 show_planets = True
 show_trails = True
+
+# Control panel palette (RGBA). Every fill behind text keeps >= 4.5:1 contrast with HUD_TEXT.
+HUD_TEXT = (190, 225, 235, 255)
+HUD_ACCENT = (35, 185, 200, 255)
+HUD_ACCENT_ACTIVE = (255, 170, 65, 255)
+HUD_COLORS = {
+    "Text": HUD_TEXT,
+    "WindowBg": (7, 12, 22, 250),
+    "ChildBg": (10, 18, 30, 245),
+    "Border": (30, 165, 185, 180),
+    "FrameBg": (14, 28, 42, 255),
+    "FrameBgHovered": (20, 75, 88, 255),
+    "FrameBgActive": (20, 105, 114, 255),
+    "Button": (12, 55, 70, 255),
+    "ButtonHovered": (15, 88, 102, 255),
+    "ButtonActive": (16, 105, 112, 255),
+    "Header": (12, 48, 62, 255),
+    "HeaderHovered": (16, 80, 94, 255),
+    "HeaderActive": (16, 104, 113, 255),
+    "CheckMark": (45, 225, 225, 255),
+    "SliderGrab": HUD_ACCENT,
+    "SliderGrabActive": HUD_ACCENT_ACTIVE,
+}
+PANEL_FONT_SIZE = 16
+PANEL_INPUT_WIDTH = -200  # negative: fill the row, leave this many pixels for the label
+PANEL_FONT_PATHS = (
+    r"C:\Windows\Fonts\arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+ESC_CONFIRM_SECONDS = 1.5
 
 # ============================================================
 # SHADERS
@@ -1367,7 +1401,7 @@ def reset_simulation():
             f"Density: {density:.3f} g/cm³",
         )
 
-    dpg.set_item_label("pause_button", "Pause")
+    dpg.set_item_label("pause_button", "Pause (P)")
 
     # Trail buffers are refreshed by the main/render thread on its next update.
     last_trail_update = 0.0
@@ -1375,6 +1409,7 @@ def reset_simulation():
 
 def add_body_controls(body_index, body_name):
     with dpg.collapsing_header(label=body_name, default_open=False):
+        dpg.add_text("PHYSICS", color=HUD_ACCENT)
         dpg.add_text("Position (AU)")
 
         for axis, component in zip(["X", "Y", "Z"], range(3), strict=True):
@@ -1384,7 +1419,7 @@ def add_body_controls(body_index, body_name):
                 default_value=float(positions[body_index, component]),
                 callback=set_body_value,
                 user_data=("position", body_index, component),
-                width=200,
+                width=PANEL_INPUT_WIDTH,
             )
 
         dpg.add_separator()
@@ -1397,7 +1432,7 @@ def add_body_controls(body_index, body_name):
                 default_value=float(velocities[body_index, component]),
                 callback=set_body_value,
                 user_data=("velocity", body_index, component),
-                width=200,
+                width=PANEL_INPUT_WIDTH,
             )
 
         dpg.add_separator()
@@ -1415,7 +1450,7 @@ def add_body_controls(body_index, body_name):
             min_clamped=True,
             callback=set_body_value,
             user_data=("mass", body_index, None),
-            width=200,
+            width=PANEL_INPUT_WIDTH,
         )
 
         if body_index < NUM_STARS:
@@ -1436,10 +1471,12 @@ def add_body_controls(body_index, body_name):
             min_clamped=True,
             callback=set_body_value,
             user_data=("volume", body_index, None),
-            width=200,
+            width=PANEL_INPUT_WIDTH,
         )
         dpg.add_text(f"Density: {density:.3f} g/cm³", tag=f"density_{body_index}")
 
+        dpg.add_separator()
+        dpg.add_text("DISPLAY (visual only)", color=HUD_ACCENT)
         dpg.add_input_float(
             tag=f"size_{body_index}",
             label="Visual Radius Multiplier",
@@ -1451,7 +1488,7 @@ def add_body_controls(body_index, body_name):
             min_clamped=True,
             callback=set_body_value,
             user_data=("size", body_index, None),
-            width=200,
+            width=PANEL_INPUT_WIDTH,
         )
         period_days = float(rotation_period_years[body_index] * 365.25)
         dpg.add_input_float(
@@ -1465,7 +1502,7 @@ def add_body_controls(body_index, body_name):
             min_clamped=True,
             callback=set_body_value,
             user_data=("rotation_period", body_index, None),
-            width=200,
+            width=PANEL_INPUT_WIDTH,
         )
 
 
@@ -1760,7 +1797,8 @@ glfw.window_hint(glfw.SAMPLES, 8)
 glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
 glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
 
-window = glfw.create_window(WIDTH, HEIGHT, "Three Stars + Ten Planets", None, None)
+WINDOW_TITLE = "Three Stars + Ten Planets"
+window = glfw.create_window(WIDTH, HEIGHT, WINDOW_TITLE, None, None)
 
 if not window:
     glfw.terminate()
@@ -2182,6 +2220,7 @@ mouse_sensitivity = 0.003
 mouse_down = False
 last_mouse_x = 0.0
 last_mouse_y = 0.0
+last_escape_press = -math.inf
 
 
 def get_camera_forward():
@@ -2201,6 +2240,51 @@ def mouse_button_callback(window, button, action, mods):
     if button == glfw.MOUSE_BUTTON_LEFT:
         mouse_down = action == glfw.PRESS
         last_mouse_x, last_mouse_y = glfw.get_cursor_pos(window)
+
+
+def sync_mouse_down(window):
+    global mouse_down, last_mouse_x, last_mouse_y
+
+    mouse_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+    last_mouse_x, last_mouse_y = glfw.get_cursor_pos(window)
+
+
+def window_focus_callback(window, focused):
+    global mouse_down
+
+    if focused:
+        sync_mouse_down(window)
+    else:
+        mouse_down = False
+
+
+def cursor_enter_callback(window, entered):
+    if entered:
+        sync_mouse_down(window)
+
+
+def toggle_pause():
+    global paused
+
+    paused = not paused
+    if control_panel_open:
+        dpg.set_item_label("pause_button", "Resume (P)" if paused else "Pause (P)")
+
+
+def key_callback(window, key, scancode, action, mods):
+    global last_escape_press
+
+    if action != glfw.PRESS:
+        return
+    if key == glfw.KEY_P:
+        toggle_pause()
+    elif key == glfw.KEY_ESCAPE:
+        now = glfw.get_time()
+        if now - last_escape_press < ESC_CONFIRM_SECONDS:
+            glfw.set_window_should_close(window, True)
+        else:
+            last_escape_press = now
+            glfw.set_window_title(window, f"{WINDOW_TITLE} - press Esc again to quit")
 
 
 def cursor_position_callback(window, x, y):
@@ -2363,170 +2447,116 @@ def resolve_camera_motion(start, end, centers, radii):
 glfw.set_mouse_button_callback(window, mouse_button_callback)
 glfw.set_cursor_pos_callback(window, cursor_position_callback)
 glfw.set_scroll_callback(window, scroll_callback)
-glfw.set_scroll_callback(window, scroll_callback)
+glfw.set_window_focus_callback(window, window_focus_callback)
+glfw.set_cursor_enter_callback(window, cursor_enter_callback)
+glfw.set_key_callback(window, key_callback)
 
 
 # ============================================================
 # control pannel
 # ============================================================
-def run_control_panel():
-    global paused, time_scale
-
-    dpg.create_context()
-
+def build_theme():
     with dpg.theme() as hud_theme, dpg.theme_component(dpg.mvAll):
-        dpg.add_theme_color(
-            dpg.mvThemeCol_Text,
-            (190, 225, 235, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_WindowBg,
-            (7, 12, 22, 250),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_ChildBg,
-            (10, 18, 30, 245),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_Border,
-            (30, 165, 185, 180),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_FrameBg,
-            (14, 28, 42, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_FrameBgHovered,
-            (20, 75, 88, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_FrameBgActive,
-            (22, 115, 125, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_Button,
-            (12, 55, 70, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_ButtonHovered,
-            (18, 115, 130, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_ButtonActive,
-            (25, 155, 165, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_Header,
-            (12, 48, 62, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_HeaderHovered,
-            (18, 95, 110, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_HeaderActive,
-            (20, 125, 135, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_CheckMark,
-            (45, 225, 225, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_SliderGrab,
-            (35, 185, 200, 255),
-        )
-        dpg.add_theme_color(
-            dpg.mvThemeCol_SliderGrabActive,
-            (255, 170, 65, 255),
-        )
-        dpg.add_theme_style(
-            dpg.mvStyleVar_WindowRounding,
-            5,
-        )
-        dpg.add_theme_style(
-            dpg.mvStyleVar_FrameRounding,
-            3,
-        )
-        dpg.add_theme_style(
-            dpg.mvStyleVar_GrabRounding,
-            3,
-        )
-
+        for name, color in HUD_COLORS.items():
+            dpg.add_theme_color(getattr(dpg, f"mvThemeCol_{name}"), color)
+        dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 5)
+        dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
+        dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 3)
     dpg.bind_theme(hud_theme)
 
-    with dpg.window(label="Simulation Controls", width=450, height=800):
 
-        def toggle_pause():
-            global paused
-            paused = not paused
-            dpg.set_item_label("pause_button", "Resume" if paused else "Pause")
+def build_font():
+    """Bind a TTF panel font; on macOS rasterise at retina scale and draw it back down."""
+    font_path = next((path for path in PANEL_FONT_PATHS if os.path.exists(path)), None)
+    if font_path is None:
+        return
+    content_scale = max(glfw.get_window_content_scale(window)[0], 1.0)
+    with dpg.font_registry():
+        font = dpg.add_font(font_path, round(PANEL_FONT_SIZE * content_scale))
+    dpg.bind_font(font)
+    if sys.platform == "darwin":
+        dpg.set_global_font_scale(1.0 / content_scale)
 
-        dpg.add_button(label="Reset Simulation", callback=reset_simulation)
 
-        dpg.add_button(label="Pause", tag="pause_button", callback=toggle_pause)
+def build_global_controls():
+    dpg.add_button(label="Reset Simulation", callback=reset_simulation)
+    dpg.add_button(label="Pause (P)", tag="pause_button", callback=toggle_pause)
+    dpg.add_text(
+        "Camera: drag left mouse to look, W/A/S/D move, Space up, Ctrl down, "
+        "scroll to zoom. P pause, Esc twice to quit.",
+        wrap=0,
+    )
+    dpg.add_separator()
 
-        dpg.add_slider_float(
-            label="Time Speed",
-            min_value=0.1,
-            max_value=10.0,
-            default_value=1.0,
-            callback=lambda s, a: set_time_scale(a),
-        )
+    dpg.add_slider_float(
+        label="Time Speed",
+        min_value=0.1,
+        max_value=10.0,
+        default_value=1.0,
+        width=PANEL_INPUT_WIDTH,
+        callback=lambda s, a: set_time_scale(a),
+    )
+    dpg.add_separator()
 
-        dpg.add_checkbox(
-            label="Show Trajectories",
-            default_value=True,
-            callback=lambda s, a: set_show_trails(a),
-        )
-        dpg.add_checkbox(
-            label="Show Planets",
-            default_value=show_planets,
-            callback=lambda s, a: set_show_planets(a),
-        )
+    dpg.add_text("DISPLAY (visual only, physics unchanged)")
+    dpg.add_checkbox(
+        label="Show Trajectories",
+        default_value=True,
+        callback=lambda s, a: set_show_trails(a),
+    )
+    dpg.add_checkbox(
+        label="Show Planets",
+        default_value=show_planets,
+        callback=lambda s, a: set_show_planets(a),
+    )
+    dpg.add_slider_float(
+        label="Star Size Exaggeration",
+        min_value=0.25,
+        max_value=4.0,
+        default_value=star_scale,
+        width=PANEL_INPUT_WIDTH,
+        callback=lambda s, a: set_star_scale(a),
+    )
+    dpg.add_slider_float(
+        label="Planet Size Exaggeration",
+        min_value=0.25,
+        max_value=4.0,
+        default_value=planet_scale,
+        width=PANEL_INPUT_WIDTH,
+        callback=lambda s, a: set_planet_scale(a),
+    )
+    dpg.add_separator()
 
-        dpg.add_slider_float(
-            label="Star Size Exaggeration",
-            min_value=0.25,
-            max_value=4.0,
-            default_value=star_scale,
-            callback=lambda s, a: set_star_scale(a),
-        )
 
-        dpg.add_slider_float(
-            label="Planet Size Exaggeration",
-            min_value=0.25,
-            max_value=4.0,
-            default_value=planet_scale,
-            callback=lambda s, a: set_planet_scale(a),
-        )
-        dpg.add_text("Display exaggeration is visual only; physics uses physical mass and volume.")
+def build_system_sections():
+    dpg.add_text("STAR SYSTEMS")
+    for system_index, system_name in enumerate(system_names):
+        with dpg.collapsing_header(
+            label=system_name,
+            default_open=(system_index == 0),
+        ):
+            dpg.add_button(
+                label="Travel to system",
+                callback=request_travel,
+                user_data=system_index,
+            )
+            for star_index in system_star_indices[system_index]:
+                add_body_controls(star_index, f"{system_name} Star")
+            for planet_index in system_planet_indices[system_index]:
+                add_body_controls(NUM_STARS + planet_index, planet_names[planet_index])
 
-        dpg.add_separator()
 
-        dpg.add_text("STAR SYSTEMS")
+def run_control_panel():
+    dpg.create_context()
+    build_theme()
+    build_font()
 
-        for system_index, system_name in enumerate(system_names):
-            with dpg.collapsing_header(
-                label=system_name,
-                default_open=(system_index == 0),
-            ):
-                dpg.add_button(
-                    label="Travel to system",
-                    callback=request_travel,
-                    user_data=system_index,
-                )
+    with dpg.window(label="Simulation Controls", tag="control_window"):
+        build_global_controls()
+        build_system_sections()
 
-                for star_index in system_star_indices[system_index]:
-                    add_body_controls(star_index, f"{system_name} Star")
-
-                for planet_index in system_planet_indices[system_index]:
-                    body_index = NUM_STARS + planet_index
-                    add_body_controls(
-                        body_index,
-                        planet_names[planet_index],
-                    )
     dpg.create_viewport(title="Simulation Controls", width=470, height=850, vsync=False)
-
+    dpg.set_primary_window("control_window", True)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     glfw.make_context_current(window)
@@ -2589,8 +2619,11 @@ try:
         delta_time = max(current_time - last_frame_time, 1e-6)
         last_frame_time = current_time
 
-        if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
-            break
+        if math.isfinite(last_escape_press) and (
+            current_time - last_escape_press >= ESC_CONFIRM_SECONDS
+        ):
+            last_escape_press = -math.inf
+            glfw.set_window_title(window, WINDOW_TITLE)
         while not travel_requests.empty():
             travel_to_system(travel_requests.get())
 
