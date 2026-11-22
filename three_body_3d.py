@@ -61,6 +61,8 @@ PANEL_FONT_PATHS = (
     "/Library/Fonts/Arial.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 )
+ENERGY_ERROR_GOOD = 1e-6
+ENERGY_ERROR_POOR = 1e-3
 ESC_CONFIRM_SECONDS = 1.5
 
 # ============================================================
@@ -1165,8 +1167,9 @@ cached_acceleration = None
 
 def invalidate_physics_cache():
     """Call after any edit to positions, masses or radii."""
-    global cached_acceleration
+    global cached_acceleration, diagnostics_rebaseline
     cached_acceleration = None
+    diagnostics_rebaseline = True
 
 
 def physics_step():
@@ -1196,6 +1199,89 @@ def physics_step():
     velocities += 0.5 * a1 * DT
     cached_acceleration = a1
     return True
+
+
+# ============================================================
+# CONSERVATION DIAGNOSTICS
+# A symplectic integrator keeps the energy error bounded; linear and
+# angular momentum should stay constant to round-off.
+# ============================================================
+
+DIAGNOSTICS_INTERVAL = 0.25  # wall-clock seconds between panel updates
+DIAGNOSTICS_HISTORY = 600
+diagnostics_rebaseline = True
+diagnostics_baseline = None
+last_diagnostics_update = 0.0
+energy_error_times = []
+energy_error_values = []
+
+
+def conserved_quantities():
+    """Return total energy (M_sun AU^2/yr^2), linear and angular momentum vectors."""
+    kinetic = 0.5 * float(np.sum(masses * np.einsum("ij,ij->i", velocities, velocities)))
+
+    i, j = np.triu_indices(NUM_BODIES, k=1)
+    distance = np.linalg.norm(positions[i] - positions[j], axis=1)
+    potential = -G * float(np.sum(masses[i] * masses[j] / np.maximum(distance, 1e-12)))
+
+    momentum = np.sum(masses[:, None] * velocities, axis=0)
+    angular_momentum = np.sum(masses[:, None] * np.cross(positions, velocities), axis=0)
+    return kinetic + potential, momentum, angular_momentum
+
+
+def update_diagnostics(force=False):
+    """Recompute conserved quantities and push them to the control panel."""
+    global diagnostics_rebaseline, diagnostics_baseline, last_diagnostics_update
+
+    now = time.time()
+    if (
+        not force
+        and not diagnostics_rebaseline
+        and now - last_diagnostics_update < DIAGNOSTICS_INTERVAL
+    ):
+        return
+    last_diagnostics_update = now
+
+    energy, momentum, angular_momentum = conserved_quantities()
+    if diagnostics_rebaseline or diagnostics_baseline is None:
+        diagnostics_baseline = (energy, momentum.copy(), angular_momentum.copy())
+        diagnostics_rebaseline = False
+        energy_error_times.clear()
+        energy_error_values.clear()
+
+    energy0, _, angular_momentum0 = diagnostics_baseline
+    energy_error = abs((energy - energy0) / energy0) if energy0 != 0.0 else 0.0
+    angular_error = float(
+        np.linalg.norm(angular_momentum - angular_momentum0)
+        / max(np.linalg.norm(angular_momentum0), 1e-300)
+    )
+
+    energy_error_times.append(simulation_years)
+    energy_error_values.append(math.log10(max(energy_error, 1e-16)))
+    if len(energy_error_times) > DIAGNOSTICS_HISTORY:
+        del energy_error_times[0]
+        del energy_error_values[0]
+
+    if not control_panel_open:
+        return
+    dpg.set_value("diag_time", f"t = {simulation_years:.5f} yr   dt = {DT:g} yr")
+    dpg.set_value("diag_energy", f"E = {energy:.9e}")
+    if energy_error < ENERGY_ERROR_GOOD:
+        energy_verdict = "good"
+    elif energy_error < ENERGY_ERROR_POOR:
+        energy_verdict = "acceptable"
+    else:
+        energy_verdict = "poor, reduce dt"
+    dpg.set_value(
+        "diag_energy_error", f"Energy drift |dE/E0| = {energy_error:.3e}  ({energy_verdict})"
+    )
+    dpg.set_value(
+        "diag_momentum", f"Total momentum |P| = {np.linalg.norm(momentum):.3e}  (ideal 0)"
+    )
+    dpg.set_value("diag_angular_error", f"Angular momentum drift |dL|/|L0| = {angular_error:.3e}")
+    dpg.set_value("energy_series", [energy_error_times, energy_error_values])
+    dpg.fit_axis_data("energy_x_axis")
+    dpg.fit_axis_data("energy_y_axis")
 
 
 # collision detection
@@ -2528,6 +2614,30 @@ def build_global_controls():
     dpg.add_separator()
 
 
+def build_diagnostics():
+    with dpg.collapsing_header(label="Conservation diagnostics", default_open=False):
+        dpg.add_text(
+            "Relative drift of conserved quantities since the baseline. "
+            f"Energy: below {ENERGY_ERROR_GOOD:.0e} good, above {ENERGY_ERROR_POOR:.0e} "
+            "means the timestep is too large for this configuration.",
+            wrap=0,
+        )
+        dpg.add_text("", tag="diag_time")
+        dpg.add_text("", tag="diag_energy")
+        dpg.add_text("", tag="diag_energy_error")
+        dpg.add_text("", tag="diag_momentum")
+        dpg.add_text("", tag="diag_angular_error")
+        dpg.add_text(
+            "Baseline resets after Reset or any body edit.",
+            wrap=0,
+        )
+        with dpg.plot(label="Relative energy error", height=180, width=-1):
+            dpg.add_plot_axis(dpg.mvXAxis, label="time (yr)", tag="energy_x_axis")
+            with dpg.plot_axis(dpg.mvYAxis, label="log10 |dE/E0|", tag="energy_y_axis"):
+                dpg.add_line_series([], [], tag="energy_series")
+    dpg.add_separator()
+
+
 def build_system_sections():
     dpg.add_text("STAR SYSTEMS")
     for system_index, system_name in enumerate(system_names):
@@ -2553,6 +2663,7 @@ def run_control_panel():
 
     with dpg.window(label="Simulation Controls", tag="control_window"):
         build_global_controls()
+        build_diagnostics()
         build_system_sections()
 
     dpg.create_viewport(title="Simulation Controls", width=470, height=850, vsync=False)
@@ -2647,6 +2758,8 @@ try:
 
                     if len(history[i]) > TRAIL_LENGTH + HISTORY_TRIM_BATCH:
                         del history[i][:HISTORY_TRIM_BATCH]
+
+        update_diagnostics()
 
         # ==========================================#
         # REFRESH TRAJECTORY BUFFERS
