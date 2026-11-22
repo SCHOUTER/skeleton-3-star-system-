@@ -753,7 +753,7 @@ extra_star_densities = []
 extra_star_positions = []
 extra_star_velocities = []
 
-for system_index, system_name in enumerate(system_names[1:]):
+for system_name in system_names[1:]:
     direction = system_rng.normal(size=3)
     direction /= np.linalg.norm(direction)
 
@@ -1034,7 +1034,7 @@ MIN_ROTATION_PERIOD_DAYS = 0.01
 
 planet_radii_au = []
 
-for mass, density in zip(planet_masses, planet_densities):
+for mass, density in zip(planet_masses, planet_densities, strict=True):
     mass_kg = mass * SOLAR_MASS_KG
     density_kg_m3 = density * 1000.0
     radius_m = (3.0 * mass_kg / (4.0 * math.pi * density_kg_m3)) ** (1.0 / 3.0)
@@ -1044,7 +1044,7 @@ planet_radii_au = np.array(planet_radii_au)
 
 star_radii_au = []
 
-for mass, density in zip(star_masses, star_densities):
+for mass, density in zip(star_masses, star_densities, strict=True):
     mass_kg = mass * SOLAR_MASS_KG
     density_kg_m3 = density * 1000.0
 
@@ -1365,7 +1365,7 @@ def add_body_controls(body_index, body_name):
     with dpg.collapsing_header(label=body_name, default_open=False):
         dpg.add_text("Position (AU)")
 
-        for axis, component in zip(["X", "Y", "Z"], range(3)):
+        for axis, component in zip(["X", "Y", "Z"], range(3), strict=True):
             dpg.add_input_float(
                 tag=f"position_{body_index}_{component}",
                 label=f"Position {axis}",
@@ -1378,7 +1378,7 @@ def add_body_controls(body_index, body_name):
         dpg.add_separator()
         dpg.add_text("Velocity (AU/year)")
 
-        for axis, component in zip(["X", "Y", "Z"], range(3)):
+        for axis, component in zip(["X", "Y", "Z"], range(3), strict=True):
             dpg.add_input_float(
                 tag=f"velocity_{body_index}_{component}",
                 label=f"Velocity {axis}",
@@ -1747,7 +1747,6 @@ glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 glfw.window_hint(glfw.SAMPLES, 8)
 glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
 glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 
 window = glfw.create_window(WIDTH, HEIGHT, "Three Stars + Ten Planets", None, None)
 
@@ -1878,7 +1877,7 @@ for system_name in system_names:
     system_label_textures.append((texture, image.size))
 
 print("OpenGL renderer:", ctx.info.get("GL_RENDERER", "Unknown"))
-print("Bodies: 3 stars, 6 rocky planets, 4 gas giants")
+print(f"Bodies: {NUM_STARS} stars, {NUM_PLANETS} planets in {len(system_names)} systems")
 print("Drag mouse to rotate; scroll to zoom; ESC to exit.")
 
 # Background star GPU buffers.
@@ -2294,7 +2293,7 @@ def update_camera(delta_time):
 def constrain_camera_to_bodies(centers, radii):
     global camera_position
 
-    for body_index, (center, radius) in enumerate(zip(centers, radii)):
+    for body_index, (center, radius) in enumerate(zip(centers, radii, strict=True)):
         if body_index >= NUM_STARS and not show_planets:
             continue
 
@@ -2319,7 +2318,7 @@ def resolve_camera_motion(start, end, centers, radii):
 
     earliest_intersection = 1.0
     displacement_length = math.sqrt(displacement_squared)
-    for body_index, (center, radius) in enumerate(zip(centers, radii)):
+    for body_index, (center, radius) in enumerate(zip(centers, radii, strict=True)):
         if body_index >= NUM_STARS and not show_planets:
             continue
 
@@ -2750,7 +2749,7 @@ try:
         right /= np.linalg.norm(right)
         camera_up = np.cross(right, forward)
 
-        for chunk_key, (buffer, vao) in background_chunks.items():
+        for chunk_key, (_buffer, vao) in background_chunks.items():
             if chunk_is_visible(
                 chunk_key,
                 forward,
