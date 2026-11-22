@@ -1356,41 +1356,31 @@ def update_diagnostics(force=False):
     dpg.fit_axis_data("energy_y_axis")
 
 
-# collision detection
-def detect_collision(pos, previous_pos=None):
-    if previous_pos is None:
-        pairwise_offsets = pos[:, None, :] - pos[None, :, :]
-        pairwise_distances = np.linalg.norm(pairwise_offsets, axis=2)
-    else:
-        pairwise_offsets = previous_pos[:, None, :] - previous_pos[None, :, :]
-        pairwise_motion = (pos - previous_pos)[:, None, :] - (pos - previous_pos)[None, :, :]
-        motion_squared = np.einsum(
-            "ijk,ijk->ij",
-            pairwise_motion,
-            pairwise_motion,
-        )
-        start_motion_dot = np.einsum(
-            "ijk,ijk->ij",
-            pairwise_offsets,
-            pairwise_motion,
-        )
-        closest_time = np.zeros_like(motion_squared)
-        np.divide(
-            -start_motion_dot,
-            motion_squared,
-            out=closest_time,
-            where=motion_squared > 1e-20,
-        )
-        np.clip(closest_time, 0.0, 1.0, out=closest_time)
-        closest_offsets = pairwise_offsets + closest_time[:, :, None] * pairwise_motion
-        pairwise_distances = np.linalg.norm(closest_offsets, axis=2)
-
+def detect_collision(pos, previous_pos):
+    """First pair (i, j) whose spheres touch while moving linearly from previous_pos to pos."""
+    pairwise_offsets = previous_pos[:, None, :] - previous_pos[None, :, :]
     minimum_distances = collision_radii[:, None] + collision_radii[None, :]
-    colliding_pairs = np.argwhere(np.triu(pairwise_distances <= minimum_distances, k=1))
 
-    if len(colliding_pairs) == 0:
+    # Cheap rejection: the gap can shrink by at most both bodies' step lengths.
+    start_distances = np.sqrt(np.einsum("ijk,ijk->ij", pairwise_offsets, pairwise_offsets))
+    step_lengths = np.linalg.norm(pos - previous_pos, axis=1)
+    gaps = start_distances - step_lengths[:, None] - step_lengths[None, :] - minimum_distances
+    np.fill_diagonal(gaps, np.inf)
+    if gaps.min() > 1e-9:
         return None
 
+    pairwise_motion = (pos - previous_pos)[:, None, :] - (pos - previous_pos)[None, :, :]
+    motion_squared = np.einsum("ijk,ijk->ij", pairwise_motion, pairwise_motion)
+    start_motion_dot = np.einsum("ijk,ijk->ij", pairwise_offsets, pairwise_motion)
+    closest_time = np.zeros_like(motion_squared)
+    np.divide(-start_motion_dot, motion_squared, out=closest_time, where=motion_squared > 1e-20)
+    np.clip(closest_time, 0.0, 1.0, out=closest_time)
+    closest_offsets = pairwise_offsets + closest_time[:, :, None] * pairwise_motion
+    pairwise_distances = np.linalg.norm(closest_offsets, axis=2)
+
+    colliding_pairs = np.argwhere(np.triu(pairwise_distances <= minimum_distances, k=1))
+    if len(colliding_pairs) == 0:
+        return None
     return tuple(int(index) for index in colliding_pairs[0])
 
 
@@ -1878,10 +1868,8 @@ for i in range(NUM_BODIES):
 # ============================================================
 
 BACKGROUND_CHUNK_SIZE = 200.0
-STARS_PER_CHUNK = 75000
-BACKGROUND_STAR_LOD_COUNT = 24000
+STARS_PER_CHUNK = 24000
 BACKGROUND_CHUNK_OFFSETS = [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1)]
-BACKGROUND_VISIBLE_STAR_COUNT = STARS_PER_CHUNK * len(BACKGROUND_CHUNK_OFFSETS)
 
 # Kept for the existing deterministic nebula generation below.
 rng = np.random.default_rng(42)
@@ -1956,30 +1944,7 @@ def generate_star_chunk(chunk_x, chunk_y, chunk_z):
         3.5,
     ).astype(np.float32)
 
-    star_data = np.column_stack(
-        [
-            star_positions.astype(np.float32),
-            colors,
-            sizes,
-        ]
-    ).astype(np.float32)
-    chunk_rng.shuffle(star_data, axis=0)
-    return star_data
-
-
-def generate_visible_stars(center_chunk):
-    chunk_data = []
-
-    for offset_x, offset_y, offset_z in BACKGROUND_CHUNK_OFFSETS:
-        chunk_data.append(
-            generate_star_chunk(
-                center_chunk[0] + offset_x,
-                center_chunk[1] + offset_y,
-                center_chunk[2] + offset_z,
-            )
-        )
-
-    return np.vstack(chunk_data).astype(np.float32)
+    return np.column_stack([star_positions, colors, sizes]).astype(np.float32)
 
 
 # ======================================================
@@ -3182,10 +3147,7 @@ try:
                 width / height,
                 far_plane,
             ):
-                vao.render(
-                    mode=moderngl.POINTS,
-                    vertices=BACKGROUND_STAR_LOD_COUNT,
-                )
+                vao.render(mode=moderngl.POINTS)
 
         # Main bodies
         body_vao.render(
