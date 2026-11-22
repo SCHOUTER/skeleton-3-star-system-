@@ -1126,14 +1126,22 @@ def acceleration(pos):
     return np.sum(delta * factors[:, :, None], axis=1)
 
 
+cached_acceleration = None
+
+
+def invalidate_physics_cache():
+    """Call after any edit to positions, masses or radii."""
+    global cached_acceleration
+    cached_acceleration = None
+
+
 def physics_step():
-    # Velocity-Verlet / leapfrog-style integration.
-    global positions, velocities, paused
+    global positions, velocities, paused, cached_acceleration
 
     previous_positions = positions.copy()
     previous_velocities = velocities.copy()
 
-    a0 = acceleration(positions)
+    a0 = cached_acceleration if cached_acceleration is not None else acceleration(positions)
     velocities += 0.5 * a0 * DT
     positions += velocities * DT
 
@@ -1143,6 +1151,7 @@ def physics_step():
         body_a, body_b = collision
         positions[:] = previous_positions
         velocities[:] = previous_velocities
+        cached_acceleration = a0
         print(
             f"COLLISION! Simulation stopped before overlap between Body {body_a} and Body {body_b}."
         )
@@ -1151,6 +1160,7 @@ def physics_step():
 
     a1 = acceleration(positions)
     velocities += 0.5 * a1 * DT
+    cached_acceleration = a1
     return True
 
 
@@ -1212,6 +1222,7 @@ def limit_visual_overlap(centers, radii, floor_radii, gap=0.9):
 
 def set_body_value(sender, app_data, user_data):
     property_name, body_index, component = user_data
+    invalidate_physics_cache()
 
     if property_name == "position":
         positions[body_index, component] = app_data
@@ -1324,6 +1335,7 @@ def reset_simulation():
 
     simulation_years = 0.0
     paused = False
+    invalidate_physics_cache()
 
     for i in range(NUM_BODIES):
         history[i].clear()
@@ -2595,9 +2607,10 @@ try:
 
                 simulation_years += DT
 
-                # Save trajectory history
+                # Save trajectory history; one snapshot per step, rows shared as views
+                snapshot = positions.copy()
                 for i in range(NUM_BODIES):
-                    history[i].append((simulation_years, positions[i].copy()))
+                    history[i].append((simulation_years, snapshot[i]))
 
                     if len(history[i]) > TRAIL_LENGTH + HISTORY_TRIM_BATCH:
                         del history[i][:HISTORY_TRIM_BATCH]
